@@ -89,12 +89,6 @@
     // ==========================================
     // 1. FIREBASE & STATE
     // ==========================================
-<!-- 引入 Firebase 核心與 Realtime Database SDK -->
-  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
-
-  <script>
-    // 貼上您剛剛取得的真實金鑰設定
     const firebaseConfig = {
       apiKey: "AIzaSyDh14SJnzzIeH9mW0so9_R5Xjk1dPdy_P4",
       authDomain: "doujinshi-plan.firebaseapp.com",
@@ -106,7 +100,6 @@
       measurementId: "G-90RQWWLFT6"
     };
 
-    // 初始化 Firebase 與資料庫
     let useFirebase = false;
     let db = null;
     try {
@@ -118,7 +111,6 @@
     } catch (e) {
       useFirebase = false;
     }
-  </script>
 
     if (!useFirebase) {
       document.getElementById('sync-status').innerHTML = '<i class="fa-solid fa-triangle-exclamation mr-1"></i>單機預覽模式';
