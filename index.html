@@ -3596,9 +3596,8 @@
       const codeInput = document.getElementById(`edit-b-code-${boothId}`);
       const circleInput = document.getElementById(`edit-b-circle-${boothId}`);
       if (codeInput && circleInput) {
-        const code = codeInput.value.trim();
-        const circle = circleInput.value.trim();
-        if (!code || !circle) return alert('請填寫攤位編號與社團名稱');
+        const code = codeInput.value.trim() || '未編號';
+        const circle = circleInput.value.trim() || '未命名社團';
         const booth = state.events[state.activeEventId].booths[boothId];
         const prevAuthors = getBoothAuthors(booth);
         const authorBlocks = document.querySelectorAll(`.edit-author-block-${boothId}`);
@@ -3608,6 +3607,7 @@
           const prev = prevAuthors[idx] || { sashiire: [], sashiireGiven: {} };
           return { name, links, sashiire: prev.sashiire || [], sashiireGiven: prev.sashiireGiven || {} };
         }).filter(a => a.name);
+        if (updatedAuthors.length === 0) return alert('請填寫至少一位作者名稱');
 
         const flyers = getBoothFlyers(booth);
         flyers.forEach((f, idx) => {
@@ -4136,11 +4136,11 @@
         <div class="space-y-3 max-h-[75vh] overflow-y-auto pr-1">
           <div class="grid grid-cols-2 gap-2">
             <div>
-              <label class="text-xs text-gray-500">攤位編號 *</label>
+              <label class="text-xs text-gray-500">攤位編號 (選填)</label>
               <input id="new-b-code" type="text" placeholder="例: B-12a" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
             </div>
             <div>
-              <label class="text-xs text-gray-500">社團名稱 *</label>
+              <label class="text-xs text-gray-500">社團名稱 (選填)</label>
               <input id="new-b-circle" type="text" placeholder="社團名" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
             </div>
           </div>
@@ -4300,15 +4300,15 @@
     }
 
     function createBooth() {
-      const code = document.getElementById('new-b-code').value.trim();
-      const circle = document.getElementById('new-b-circle').value.trim();
-      if (!code || !circle) return alert('請填寫攤位編號與社團名稱');
+      const code = document.getElementById('new-b-code').value.trim() || '未編號';
+      const circle = document.getElementById('new-b-circle').value.trim() || '未命名社團';
       const authorBlocks = document.querySelectorAll('.new-author-block');
       const authors = Array.from(authorBlocks).map((blk) => {
         const name = blk.querySelector('.new-b-author-name').value.trim();
         const links = Array.from(blk.querySelectorAll('.new-b-author-link')).map(i => i.value.trim()).filter(Boolean);
         return { name, links, sashiire: [], sashiireGiven: {} };
       }).filter(a => a.name);
+      if (authors.length === 0) return alert('請填寫至少一位作者名稱');
 
       const flyerItems = document.querySelectorAll('.new-b-flyer-item');
       const flyerImages = [];
