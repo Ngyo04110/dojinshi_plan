@@ -137,10 +137,10 @@
 
     // 圖片壓縮規格（降低單張 Base64 體積，加速行動網路傳輸）
     const IMG_PRESET = {
-      item: { maxWidth: 480, quality: 0.68 },
-      boothMap: { maxWidth: 480, quality: 0.68 },
-      flyer: { maxWidth: 720, quality: 0.65 },
-      hallMap: { maxWidth: 900, quality: 0.65 }
+      item: { maxWidth: 400, quality: 0.62 },
+      boothMap: { maxWidth: 400, quality: 0.62 },
+      flyer: { maxWidth: 600, quality: 0.60 },
+      hallMap: { maxWidth: 760, quality: 0.60 }
     };
 
     // 增量更新佇列：key 為 Firebase 路徑，value 為要更新的值
@@ -649,16 +649,31 @@
       }
 
       if (useFirebase && db) {
+        let reconnectGraceTimer = null;
+
         db.ref('.info/connected').on('value', (snap) => {
           isFirebaseConnected = snap.val() === true;
           if (isFirebaseConnected) {
-            if (hasCloudInitialLoadCompleted && hasPendingLocalChanges) {
+            if (reconnectGraceTimer) {
+              clearTimeout(reconnectGraceTimer);
+              reconnectGraceTimer = null;
+            }
+            if (hasCloudInitialLoadCompleted && (hasPendingLocalChanges || Object.keys(pendingPatchMap).length > 0)) {
               syncToCloudIfNeeded(false);
             } else if (!isUploadingToCloud && hasCloudInitialLoadCompleted) {
-              updateSyncBadge('synced', hasPendingLocalChanges ? '已連線 · 待同步' : '已連線');
+              updateSyncBadge('synced', (hasPendingLocalChanges || Object.keys(pendingPatchMap).length > 0) ? '同步中...' : '已連線');
             }
           } else {
-            updateSyncBadge('error', hasPendingLocalChanges ? '離線（待同步）' : '離線暫存中');
+            // 行動網路切換或瞬間掉線時，先給 1.8 秒寬限期，避免短暫閃斷立刻跳成「離線（待同步）」
+            if (!reconnectGraceTimer) {
+              reconnectGraceTimer = setTimeout(() => {
+                reconnectGraceTimer = null;
+                if (!isFirebaseConnected) {
+                  try { db.goOnline(); } catch (e) {}
+                  updateSyncBadge('error', (hasPendingLocalChanges || Object.keys(pendingPatchMap).length > 0) ? '網路重連中 · 待同步' : '網路重連中');
+                }
+              }, 1800);
+            }
           }
         });
 
@@ -682,13 +697,13 @@
           }
 
           // 若本地標記有待同步變更，先比對「雲端與本地誰才是真正較新／較完整的資料」
-          if (hasPendingLocalChanges) {
+          if (hasPendingLocalChanges || Object.keys(pendingPatchMap).length > 0) {
             const currentPayload = getPersistablePayload();
             const currentStats = countDataStats(currentPayload);
 
             // 情況 1：本地無有效資料但雲端有資料 -> 直接採納雲端，清除錯誤待同步旗標
             if (!hasAnyMeaningfulData(currentPayload) && cloudMeaningful) {
-              clearPendingFlag();
+              await clearPendingFlag();
               applyLoadedData(val);
               await persistStateLocally(false);
               updateSyncBadge('synced', '已同步雲端資料');
@@ -697,12 +712,12 @@
             }
 
             // 情況 2：雲端時間戳記比本地更新，或雲端攤位／圖片數多於本地（代表跨裝置已更新成功，本地只是殘留舊快取）
-            if (cloudMeaningful && (
+            if (cloudMeaningful && !needsFullSync && Object.keys(pendingPatchMap).length === 0 && (
               (cloudStats.updatedAt > 0 && currentStats.updatedAt > 0 && cloudStats.updatedAt >= currentStats.updatedAt) ||
               (cloudStats.boothsCount > currentStats.boothsCount) ||
               (cloudStats.boothsCount === currentStats.boothsCount && cloudStats.itemsCount === currentStats.itemsCount && cloudStats.imagesCount > currentStats.imagesCount)
             )) {
-              clearPendingFlag();
+              await clearPendingFlag();
               applyLoadedData(val);
               await persistStateLocally(false);
               updateSyncBadge('synced', '已自動同步雲端最新進度');
@@ -762,11 +777,11 @@
             if (!isFirebaseConnected) {
               try { db.goOnline(); } catch (e) {}
             }
-            if (hasCloudInitialLoadCompleted && hasPendingLocalChanges && !isUploadingToCloud) {
+            if (hasCloudInitialLoadCompleted && (hasPendingLocalChanges || Object.keys(pendingPatchMap).length > 0) && !isUploadingToCloud) {
               syncToCloudIfNeeded(false);
             }
           }
-        }, 6000);
+        }, 3500);
       } else {
         hasCloudInitialLoadCompleted = true;
         setLoadingOverlay(false);
@@ -788,9 +803,12 @@
       render();
 
       Object.entries(patchPathsObj || {}).forEach(([path, val]) => {
-        pendingPatchMap[path] = val === undefined ? null : val;
+        const cleanPath = String(path || '').replace(/^doujinPlanner\//, '');
+        if (cleanPath) {
+          pendingPatchMap[cleanPath] = val === undefined ? null : val;
+        }
       });
-      pendingPatchMap['doujinPlanner/updatedAt'] = localStateUpdatedAt;
+      pendingPatchMap['updatedAt'] = localStateUpdatedAt;
 
       const savedOk = await persistStateLocally(meaningful);
       if (savedOk) {
@@ -893,7 +911,7 @@
       updateSyncBadge('uploading', useIncrementalPatch ? '增量上傳中...' : '同步雲端中...');
 
       const writePromise = useIncrementalPatch
-        ? db.ref().update(sanitizeForFirebase(batchSnapshot))
+        ? db.ref('doujinPlanner').update(sanitizeForFirebase(batchSnapshot))
         : db.ref('doujinPlanner').set(payload);
 
       const timeoutPromise = new Promise((_, reject) => {
