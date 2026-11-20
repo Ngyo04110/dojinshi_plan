@@ -236,19 +236,19 @@
       let itemsCount = 0;
       let imagesCount = 0;
       evValues.forEach(ev => {
-        if (getImageSrc(ev.mapImage) || (typeof ev.mapImage === 'string' && ev.mapImage.startsWith('rtdb_media:'))) imagesCount++;
+        if (ev.mapImage) imagesCount++;
         if (ev && ev.booths && typeof ev.booths === 'object') {
           const bList = Object.values(ev.booths).filter(Boolean);
           boothsCount += bList.length;
           bList.forEach(b => {
-            if (getImageSrc(b.boothMapImage) || (typeof b.boothMapImage === 'string' && b.boothMapImage.startsWith('rtdb_media:'))) imagesCount++;
+            if (b.boothMapImage) imagesCount++;
             if (Array.isArray(b.flyerImages)) {
-              b.flyerImages.forEach(f => { if (f && (getImageSrc(f.url) || (typeof f.url === 'string' && f.url.startsWith('rtdb_media:')))) imagesCount++; });
+              b.flyerImages.forEach(f => { if (f && f.url) imagesCount++; });
             }
             if (b && b.items && typeof b.items === 'object') {
               const itList = Object.values(b.items).filter(Boolean);
               itemsCount += itList.length;
-              itList.forEach(it => { if (getImageSrc(it.itemImage) || (typeof it.itemImage === 'string' && it.itemImage.startsWith('rtdb_media:'))) imagesCount++; });
+              itList.forEach(it => { if (it.itemImage) imagesCount++; });
             }
           });
         }
@@ -739,141 +739,7 @@
       return JSON.parse(JSON.stringify(obj, (k, v) => v === undefined ? null : v));
     }
 
-    // ==========================================
-    // 局部更新 (PARTIAL UPDATE) & 圖片分流壓縮輔助
-    // ==========================================
-    const MEDIA_PREFIX = 'rtdb_media:';
-    const mediaMemoryCache = {};
-    let partialSyncTimer = null;
-    const pendingPartialPaths = new Map();
-
-    const IMAGE_PRESETS = {
-      item: { maxWidth: 560, quality: 0.68 },
-      boothMap: { maxWidth: 560, quality: 0.68 },
-      flyer: { maxWidth: 800, quality: 0.70 },
-      eventMap: { maxWidth: 960, quality: 0.72 }
-    };
-
-    function estimateByteSize(obj) {
-      try {
-        return new Blob([JSON.stringify(obj)]).size;
-      } catch (e) {
-        return 0;
-      }
-    }
-
-    async function externalizeLargeImage(dataUrl, thresholdBytes = 120000) {
-      if (!dataUrl || typeof dataUrl !== 'string') return '';
-      if (dataUrl.startsWith(MEDIA_PREFIX)) return dataUrl;
-      if (!dataUrl.startsWith('data:image/')) return dataUrl;
-
-      const bytes = new Blob([dataUrl]).size;
-      if (bytes <= thresholdBytes || !useFirebase || !db) {
-        return dataUrl;
-      }
-
-      const mediaId = 'img_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
-      const fullRefStr = MEDIA_PREFIX + mediaId;
-      mediaMemoryCache[fullRefStr] = dataUrl;
-
-      try {
-        await db.ref(`doujinPlannerMedia/${mediaId}`).set({
-          data: dataUrl,
-          updatedAt: Date.now()
-        });
-        return fullRefStr;
-      } catch (err) {
-        console.warn('獨立圖片節點寫入失敗，退回主資料保留:', err);
-        return dataUrl;
-      }
-    }
-
-    function getImageSrc(val) {
-      if (!val) return '';
-      if (typeof val !== 'string') return '';
-      if (val.startsWith(MEDIA_PREFIX)) {
-        if (mediaMemoryCache[val]) return mediaMemoryCache[val];
-        const mediaId = val.slice(MEDIA_PREFIX.length);
-        if (useFirebase && db && mediaId) {
-          db.ref(`doujinPlannerMedia/${mediaId}/data`).once('value').then((snap) => {
-            const d = snap.val();
-            if (d && mediaMemoryCache[val] !== d) {
-              mediaMemoryCache[val] = d;
-              const activeTag = document.activeElement ? document.activeElement.tagName : '';
-              if (activeTag !== 'INPUT' && activeTag !== 'TEXTAREA') {
-                render();
-              }
-            }
-          }).catch(() => {});
-        }
-        return '';
-      }
-      return val;
-    }
-
-    function queuePartialCloudUpdate(relPath, value) {
-      if (!useFirebase || !db) return;
-      const cleanPath = String(relPath || '').replace(/^\/+|\/+$/g, '');
-      const fullPath = cleanPath ? `doujinPlanner/${cleanPath}` : 'doujinPlanner';
-      pendingPartialPaths.set(fullPath, sanitizeForFirebase(value));
-      pendingPartialPaths.set('doujinPlanner/updatedAt', Date.now());
-
-      if (partialSyncTimer) clearTimeout(partialSyncTimer);
-      partialSyncTimer = setTimeout(() => {
-        flushPartialCloudUpdates();
-      }, 350);
-    }
-
-    async function flushPartialCloudUpdates() {
-      if (!useFirebase || !db) return;
-      if (!hasCloudInitialLoadCompleted) return;
-      if (pendingPartialPaths.size === 0) return;
-
-      const meaningful = hasAnyMeaningfulData(getPersistablePayload());
-      if (!meaningful) {
-        pendingPartialPaths.clear();
-        return;
-      }
-
-      const updates = {};
-      pendingPartialPaths.forEach((v, k) => {
-        updates[k] = v;
-      });
-      pendingPartialPaths.clear();
-
-      const payloadSize = estimateByteSize(updates);
-      if (payloadSize > 2 * 1024 * 1024) {
-        console.warn('單次局部更新體積過大 (' + payloadSize + ' bytes)，改為完整同步檢查');
-        hasPendingLocalChanges = true;
-        syncToCloudIfNeeded(true);
-        return;
-      }
-
-      isUploadingToCloud = true;
-      updateSyncBadge('uploading', '局部同步中...');
-
-      try {
-        await Promise.race([
-          db.ref().update(updates),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('雲端局部寫入逾時')), 20000))
-        ]);
-        isUploadingToCloud = false;
-        clearPendingFlag();
-        saveKnownCloudStats(countDataStats(getPersistablePayload()));
-        const nowStr = formatClockTime();
-        safeSetStorage(LOCAL_LAST_SAVED_KEY, nowStr);
-        updateLastSavedDisplay(nowStr);
-        updateSyncBadge('synced', '已連線 · 已儲存');
-      } catch (err) {
-        isUploadingToCloud = false;
-        hasPendingLocalChanges = true;
-        safeSetStorage(LOCAL_PENDING_KEY, 'true');
-        console.warn('局部同步失敗，已保留本地並等待重試:', err);
-        updateSyncBadge('pending', '本地已存 · 待重試');
-      }
-    }
-
-    async function saveData(allowEmptyOverwrite = false, partialPath = null, partialValue = undefined) {
+    async function saveData(allowEmptyOverwrite = false) {
       localStateUpdatedAt = Date.now();
       const payloadCheck = getPersistablePayload(localStateUpdatedAt);
       const meaningful = hasAnyMeaningfulData(payloadCheck);
@@ -886,13 +752,8 @@
           updateSyncBadge('error', '本地為空 · 已禁止寫入雲端');
           return;
         }
-        if (partialPath && partialValue !== undefined) {
-          updateSyncBadge('pending', '本地已存 · 局部同步中');
-          queuePartialCloudUpdate(partialPath, partialValue);
-        } else {
-          updateSyncBadge('pending', '本地已存 · 同步中');
-          syncToCloudIfNeeded(false, allowEmptyOverwrite);
-        }
+        updateSyncBadge('pending', '本地已存 · 同步中');
+        syncToCloudIfNeeded(false, allowEmptyOverwrite);
       } else {
         const nowStr = formatClockTime();
         safeSetStorage(LOCAL_LAST_SAVED_KEY, nowStr);
@@ -1387,7 +1248,7 @@
                 <div class="bg-[#F9FAF8] p-2.5 rounded-xl border border-gray-200/70">
                   <label class="text-[11px] font-bold text-gray-600 block mb-1.5">攤位圖</label>
                   <div class="flex items-center gap-2">
-                    ${b.boothMapImage ? `<img src="${getImageSrc(b.boothMapImage)}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : '<div class="w-11 h-11 bg-gray-200/70 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
+                    ${b.boothMapImage ? `<img src="${b.boothMapImage}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : '<div class="w-11 h-11 bg-gray-200/70 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
                     <label class="flex-1 text-center py-2 px-2 bg-white border border-gray-300 rounded-lg text-xs font-medium text-gray-700 cursor-pointer">
                       選擇圖片
                       <input type="file" accept="image/*" onchange="handleBoothMapUpload(event, '${b.id}')" class="hidden" />
@@ -1434,7 +1295,7 @@
                   <div class="drag-handle cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-700 px-1 py-2 touch-none select-none" data-booth-id="${b.id}" data-idx="${idx}" title="按住拖曳排序，或輕點調整">
                     <i class="fa-solid fa-bars text-sm"></i>
                   </div>
-                  ${b.boothMapImage ? `<img src="${getImageSrc(b.boothMapImage)}" class="${boothMapImgSize} object-cover rounded-lg border shrink-0 transition-all" title="攤位圖" />` : ''}
+                  ${b.boothMapImage ? `<img src="${b.boothMapImage}" class="${boothMapImgSize} object-cover rounded-lg border shrink-0 transition-all" title="攤位圖" />` : ''}
                   <span class="bg-[#4A7C6F]/10 text-[#4A7C6F] font-bold text-xs px-2 py-1 rounded-md shrink-0">
                     ${String(idx + 1).padStart(2, '0')}
                   </span>
@@ -1564,7 +1425,7 @@
                     <div class="bg-white p-2.5 rounded-lg border">
                       <label class="text-[10px] text-gray-600 font-bold block mb-1">商品圖片</label>
                       <div class="flex items-center gap-1.5 flex-wrap">
-                        ${it.itemImage ? `<img src="${getImageSrc(it.itemImage)}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : '<div class="w-11 h-11 bg-gray-200 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
+                        ${it.itemImage ? `<img src="${it.itemImage}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : '<div class="w-11 h-11 bg-gray-200 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
                         <label class="py-1.5 px-2.5 bg-gray-50 border border-gray-300 rounded-lg text-xs font-medium text-gray-700 cursor-pointer">
                           上傳
                           <input type="file" accept="image/*" onchange="handleItemImageUpload(event, '${b.id}', '${it.id}')" class="hidden" />
@@ -1593,7 +1454,7 @@
                 ` : `
                   <div class="flex justify-between items-center item-box-deep-green p-2.5 rounded-xl">
                     <div class="flex items-center gap-2.5">
-                      ${it.itemImage ? `<img src="${getImageSrc(it.itemImage)}" class="${imgSizeClass} object-cover rounded-lg border border-white shrink-0 transition-all" />` : ''}
+                      ${it.itemImage ? `<img src="${it.itemImage}" class="${imgSizeClass} object-cover rounded-lg border border-white shrink-0 transition-all" />` : ''}
                       <div>
                         <div class="text-sm font-bold text-[#2C3531] flex items-center gap-1 flex-wrap">
                           ${it.name}
@@ -2033,7 +1894,7 @@
       `;
 
       if (state.runMode === 'map') {
-        if (!getImageSrc(currentEv.mapImage)) {
+        if (!currentEv.mapImage) {
           html += `
             <div class="card p-8 text-center">
               <i class="fa-solid fa-map-location-dot text-4xl text-gray-300 mb-3"></i>
@@ -2046,7 +1907,7 @@
             <div class="card p-2 overflow-hidden relative">
               <div class="text-xs text-gray-400 mb-2 px-2">點擊攤位標籤可快速查看</div>
               <div class="relative w-full overflow-auto border rounded-xl bg-gray-100" style="max-height: 65vh;">
-                <img src="${getImageSrc(currentEv.mapImage)}" class="w-full h-auto block" />
+                <img src="${currentEv.mapImage}" class="w-full h-auto block" />
                 ${booths.map((b, i) => {
                   const itemsArr = Object.values(b.items || {});
                   const isDone = itemsArr.length > 0 && itemsArr.every(it => {
@@ -2108,7 +1969,7 @@
                 <div class="drag-handle cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-700 px-1.5 py-2 touch-none select-none" data-booth-id="${b.id}" data-idx="${idx}" title="按住拖曳排序，或輕點調整">
                   <i class="fa-solid fa-bars text-sm"></i>
                 </div>
-                ${b.boothMapImage ? `<img src="${getImageSrc(b.boothMapImage)}" class="${boothMapImgSize} object-cover rounded-lg border shrink-0 transition-all" title="攤位圖" />` : ''}
+                ${b.boothMapImage ? `<img src="${b.boothMapImage}" class="${boothMapImgSize} object-cover rounded-lg border shrink-0 transition-all" title="攤位圖" />` : ''}
                 <div>
                   <div class="flex items-center gap-2 flex-wrap">
                     <span class="text-xs font-bold text-[#4A7C6F]">#${idx + 1}</span>
@@ -2157,7 +2018,7 @@
                   <div class="item-box-deep-green p-3 rounded-xl">
                     <div class="flex justify-between items-start mb-2">
                       <div class="flex items-center gap-2.5">
-                        ${it.itemImage ? `<img src="${getImageSrc(it.itemImage)}" class="${runImgClass} object-cover rounded-lg border border-white shrink-0 transition-all" />` : ''}
+                        ${it.itemImage ? `<img src="${it.itemImage}" class="${runImgClass} object-cover rounded-lg border border-white shrink-0 transition-all" />` : ''}
                         <div>
                           <div class="font-bold text-sm text-[#2C3531] flex items-center flex-wrap gap-1">
                             ${it.name}
@@ -2645,7 +2506,7 @@
                   <div class="bg-[#F9FAF8] p-3.5 rounded-xl border border-gray-200 space-y-2.5">
                     <div class="flex justify-between items-center">
                       <div class="flex items-center gap-2.5">
-                        ${item.itemImage ? `<img src="${getImageSrc(item.itemImage)}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : ''}
+                        ${item.itemImage ? `<img src="${item.itemImage}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : ''}
                         <div>
                           <div class="text-xs font-bold text-[#4A7C6F]">${item.boothCode} ${item.circle}</div>
                           <div class="text-sm font-medium text-gray-800">${item.itemName} (${formatCurrency(item.price, currentEv.id)})</div>
@@ -2690,7 +2551,7 @@
                 return `
                   <div class="bg-[#F9FAF8] p-3.5 rounded-xl border border-gray-200 flex justify-between items-center">
                     <div class="flex items-center gap-2.5">
-                      ${item.itemImage ? `<img src="${getImageSrc(item.itemImage)}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : ''}
+                      ${item.itemImage ? `<img src="${item.itemImage}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : ''}
                       <div>
                         <div class="text-xs font-bold text-[#4A7C6F]">${item.boothCode} ${item.circle}</div>
                         <div class="text-sm font-medium text-gray-800">${item.itemName}</div>
@@ -2944,7 +2805,7 @@
               return `
                 <div class="bg-[#F9FAF8] p-3 rounded-xl border border-gray-100 flex items-center justify-between">
                   <div class="flex items-center gap-2.5">
-                    ${item.itemImage ? `<img src="${getImageSrc(item.itemImage)}" class="${imgClass} object-cover rounded border shrink-0 transition-all" />` : `<div class="${imgClass} bg-gray-200 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>`}
+                    ${item.itemImage ? `<img src="${item.itemImage}" class="${imgClass} object-cover rounded border shrink-0 transition-all" />` : `<div class="${imgClass} bg-gray-200 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>`}
                     <div>
                       <div class="text-xs font-bold text-[#4A7C6F]">${item.boothCode} ${item.circle}</div>
                       <div class="text-sm font-medium text-gray-800">${item.itemName}</div>
@@ -3103,7 +2964,7 @@
               <div class="card p-3.5 space-y-2 border border-gray-100">
                 <div class="flex justify-between items-start">
                   <div class="flex items-center gap-2.5">
-                    ${it.itemImage ? `<img src="${getImageSrc(it.itemImage)}" loading="lazy" class="w-12 h-12 object-cover rounded-lg border shrink-0" />` : '<div class="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
+                    ${it.itemImage ? `<img src="${it.itemImage}" loading="lazy" class="w-12 h-12 object-cover rounded-lg border shrink-0" />` : '<div class="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
                     <div>
                       <div class="text-xs font-bold text-[#4A7C6F]">${entry.evName} · ${entry.boothCode} ${entry.circle}</div>
                       <div class="text-sm font-medium text-gray-800">${it.name}</div>
@@ -3445,7 +3306,7 @@
                   <div class="bg-gray-50 p-2.5 rounded-lg border space-y-1.5">
                     <div class="flex justify-between items-center gap-2">
                       <div class="flex items-center gap-2.5 min-w-0">
-                        ${item.itemImage ? `<img src="${getImageSrc(item.itemImage)}" class="${imgClass} object-cover rounded border shrink-0 transition-all" />` : `<div class="${imgClass} bg-gray-200 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>`}
+                        ${item.itemImage ? `<img src="${item.itemImage}" class="${imgClass} object-cover rounded border shrink-0 transition-all" />` : `<div class="${imgClass} bg-gray-200 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>`}
                         <div class="min-w-0">
                           <div class="text-xs font-bold text-[#4A7C6F]">${item.boothCode} ${item.circle}</div>
                           <div class="text-xs font-medium text-gray-800 truncate">${item.itemName} (需求 ${item.req} / 已買 ${item.bought})</div>
@@ -3469,7 +3330,7 @@
               ${memberItems.length === 0 ? '<div class="text-center text-xs text-gray-400 py-6">此成員在此活動中無登記商品</div>' : memberItems.map(item => `
                 <div class="bg-[#F9FAF8] p-3 rounded-xl border flex items-center justify-between text-xs gap-2">
                   <div class="flex items-center gap-2.5 min-w-0">
-                    ${item.itemImage ? `<img src="${getImageSrc(item.itemImage)}" class="${imgClass} object-cover rounded border shrink-0 transition-all" />` : `<div class="${imgClass} bg-gray-200 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>`}
+                    ${item.itemImage ? `<img src="${item.itemImage}" class="${imgClass} object-cover rounded border shrink-0 transition-all" />` : `<div class="${imgClass} bg-gray-200 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>`}
                     <div class="min-w-0">
                       <span class="font-bold text-[#4A7C6F]">${item.boothCode} ${item.circle}</span>
                       <div class="font-bold text-gray-800 text-sm mt-0.5 truncate">${item.itemName}</div>
@@ -3773,7 +3634,7 @@
     // ------------------------------------------
     // 圖片上傳與剪貼板貼上（全部強制壓縮，防止大容量超載與同步失敗）
     // ------------------------------------------
-    async function extractCompressedImageFromClipboard(maxWidth = 560, quality = 0.68) {
+    async function extractCompressedImageFromClipboard(maxWidth = 760, quality = 0.72) {
       const clipboardItems = await navigator.clipboard.read();
       for (const clipboardItem of clipboardItems) {
         for (const type of clipboardItem.types) {
@@ -3789,26 +3650,22 @@
     async function handleBoothMapUpload(e, boothId) {
       const file = e.target.files[0];
       if (!file) return;
-      const booth = state.events[state.activeEventId]?.booths?.[boothId];
-      if (!booth) return;
-      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.boothMap.maxWidth, IMAGE_PRESETS.boothMap.quality);
-      booth.boothMapImage = await externalizeLargeImage(compressed);
-      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
-      await saveData(false, boothPath, booth);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 760, 0.72);
+      state.events[state.activeEventId].booths[boothId].boothMapImage = compressed;
+      await saveData();
+      render();
     }
 
     async function pasteBoothMap(boothId) {
       try {
-        const compressed = await extractCompressedImageFromClipboard(IMAGE_PRESETS.boothMap.maxWidth, IMAGE_PRESETS.boothMap.quality);
+        const compressed = await extractCompressedImageFromClipboard(760, 0.72);
         if (!compressed) {
           alert('剪貼板中沒有找到圖片');
           return;
         }
-        const booth = state.events[state.activeEventId]?.booths?.[boothId];
-        if (!booth) return;
-        booth.boothMapImage = await externalizeLargeImage(compressed);
-        const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
-        await saveData(false, boothPath, booth);
+        state.events[state.activeEventId].booths[boothId].boothMapImage = compressed;
+        await saveData();
+        render();
       } catch (err) {
         alert('無法讀取剪貼板圖片，請確認瀏覽器已允許剪貼板權限，或改用「選擇圖片」上傳。');
       }
@@ -3817,50 +3674,44 @@
     async function handleBoothFlyerUpload(e, boothId) {
       const files = Array.from(e.target.files);
       if (!files.length) return;
-      const booth = state.events[state.activeEventId]?.booths?.[boothId];
-      if (!booth) return;
+      const booth = state.events[state.activeEventId].booths[boothId];
       if (!Array.isArray(booth.flyerImages)) {
         booth.flyerImages = booth.flyerImage ? [{ url: booth.flyerImage, link: '' }] : [];
       }
       for (const file of files) {
-        const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.flyer.maxWidth, IMAGE_PRESETS.flyer.quality);
-        const storedUrl = await externalizeLargeImage(compressed);
-        booth.flyerImages.push({ url: storedUrl, link: '' });
+        const compressed = await readBlobOrFileAsCompressedDataUrl(file, 960, 0.74);
+        booth.flyerImages.push({ url: compressed, link: '' });
       }
-      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
-      await saveData(false, boothPath, booth);
+      await saveData();
+      render();
     }
 
     async function handleSingleBoothFlyerUpload(e, boothId, flyerIdx) {
       const file = e.target.files[0];
       if (!file) return;
-      const booth = state.events[state.activeEventId]?.booths?.[boothId];
-      if (!booth) return;
-      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.flyer.maxWidth, IMAGE_PRESETS.flyer.quality);
-      const storedUrl = await externalizeLargeImage(compressed);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 960, 0.74);
+      const booth = state.events[state.activeEventId].booths[boothId];
       const flyers = getBoothFlyers(booth);
-      if (flyers[flyerIdx]) flyers[flyerIdx].url = storedUrl;
+      if (flyers[flyerIdx]) flyers[flyerIdx].url = compressed;
       booth.flyerImages = flyers;
-      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
-      await saveData(false, boothPath, booth);
+      await saveData();
+      render();
     }
 
     async function pasteBoothFlyer(boothId) {
       try {
-        const compressed = await extractCompressedImageFromClipboard(IMAGE_PRESETS.flyer.maxWidth, IMAGE_PRESETS.flyer.quality);
+        const compressed = await extractCompressedImageFromClipboard(960, 0.74);
         if (!compressed) {
           alert('剪貼板中沒有找到圖片');
           return;
         }
-        const booth = state.events[state.activeEventId]?.booths?.[boothId];
-        if (!booth) return;
+        const booth = state.events[state.activeEventId].booths[boothId];
         if (!Array.isArray(booth.flyerImages)) {
           booth.flyerImages = booth.flyerImage ? [{ url: booth.flyerImage, link: '' }] : [];
         }
-        const storedUrl = await externalizeLargeImage(compressed);
-        booth.flyerImages.push({ url: storedUrl, link: '' });
-        const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
-        await saveData(false, boothPath, booth);
+        booth.flyerImages.push({ url: compressed, link: '' });
+        await saveData();
+        render();
       } catch (err) {
         alert('無法讀取剪貼板');
       }
@@ -3868,59 +3719,86 @@
 
     async function pasteSingleBoothFlyer(boothId, flyerIdx) {
       try {
-        const compressed = await extractCompressedImageFromClipboard(IMAGE_PRESETS.flyer.maxWidth, IMAGE_PRESETS.flyer.quality);
+        const compressed = await extractCompressedImageFromClipboard(960, 0.74);
         if (!compressed) {
           alert('剪貼板中沒有找到圖片');
           return;
         }
-        const booth = state.events[state.activeEventId]?.booths?.[boothId];
-        if (!booth) return;
+        const booth = state.events[state.activeEventId].booths[boothId];
         const flyers = getBoothFlyers(booth);
-        const storedUrl = await externalizeLargeImage(compressed);
-        if (flyers[flyerIdx]) flyers[flyerIdx].url = storedUrl;
+        if (flyers[flyerIdx]) flyers[flyerIdx].url = compressed;
         booth.flyerImages = flyers;
-        const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
-        await saveData(false, boothPath, booth);
+        await saveData();
+        render();
       } catch (err) {
         alert('無法讀取剪貼板');
       }
     }
 
     function removeBoothFlyer(boothId, flyerIdx) {
-      const booth = state.events[state.activeEventId]?.booths?.[boothId];
-      if (!booth) return;
+      const booth = state.events[state.activeEventId].booths[boothId];
       const flyers = getBoothFlyers(booth);
       flyers.splice(flyerIdx, 1);
       booth.flyerImages = flyers;
-      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
-      saveData(false, boothPath, booth);
+      saveData(); render();
     }
 
     function toggleItemEdit(itemId) { state.editingItems[itemId] = !state.editingItems[itemId]; render(); }
 
+    function finishItemEdit(boothId, itemId) {
+      const nameInput = document.getElementById(`edit-it-name-${itemId}`);
+      const priceInput = document.getElementById(`edit-it-price-${itemId}`);
+      const reserveInput = document.getElementById(`edit-it-reserve-${itemId}`);
+      const tagsInput = document.getElementById(`edit-it-tags-${itemId}`);
+      if (nameInput && priceInput) {
+        const name = nameInput.value.trim();
+        const price = parseFloat(priceInput.value) || 0;
+        const reserve = parseInt(reserveInput ? reserveInput.value : 0) || 0;
+        if (!name) return alert('請輸入商品名稱');
+        const linkInputs = document.querySelectorAll(`.item-link-input-${itemId}`);
+        const links = Array.from(linkInputs).map(inp => inp.value.trim()).filter(Boolean);
+        const tags = tagsInput ? tagsInput.value.split(',').map(s => s.trim()).filter(Boolean) : [];
+        const authorCheckboxes = document.querySelectorAll(`.edit-item-author-chk-${itemId}:checked`);
+        const chosenAuthors = Array.from(authorCheckboxes).map(c => c.value);
+
+        const item = state.events[state.activeEventId].booths[boothId].items[itemId];
+        item.name = name;
+        item.price = price;
+        item.reserve = reserve;
+        item.links = links;
+        item.tags = tags;
+        item.authors = chosenAuthors;
+
+        document.querySelectorAll(`.edit-member-req-input[data-item-id="${itemId}"]`).forEach(inp => {
+          const m = inp.dataset.member;
+          const req = parseInt(inp.value) || 0;
+          if (!item.orders[m]) item.orders[m] = { req: 0, bought: 0 };
+          item.orders[m].req = req;
+        });
+      }
+      state.editingItems[itemId] = false;
+      saveData(); render();
+    }
+
     async function handleItemImageUpload(e, boothId, itemId) {
       const file = e.target.files[0];
       if (!file) return;
-      const item = state.events[state.activeEventId]?.booths?.[boothId]?.items?.[itemId];
-      if (!item) return;
-      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.item.maxWidth, IMAGE_PRESETS.item.quality);
-      item.itemImage = await externalizeLargeImage(compressed);
-      const itemPath = `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`;
-      await saveData(false, itemPath, item);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 720, 0.72);
+      state.events[state.activeEventId].booths[boothId].items[itemId].itemImage = compressed;
+      await saveData();
+      render();
     }
 
     async function pasteItemImage(boothId, itemId) {
       try {
-        const compressed = await extractCompressedImageFromClipboard(IMAGE_PRESETS.item.maxWidth, IMAGE_PRESETS.item.quality);
+        const compressed = await extractCompressedImageFromClipboard(720, 0.72);
         if (!compressed) {
           alert('剪貼板中沒有找到圖片');
           return;
         }
-        const item = state.events[state.activeEventId]?.booths?.[boothId]?.items?.[itemId];
-        if (!item) return;
-        item.itemImage = await externalizeLargeImage(compressed);
-        const itemPath = `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`;
-        await saveData(false, itemPath, item);
+        state.events[state.activeEventId].booths[boothId].items[itemId].itemImage = compressed;
+        await saveData();
+        render();
       } catch (err) {
         alert('無法讀取剪貼板');
       }
@@ -3931,7 +3809,7 @@
     function openCropFromFlyerModal(boothId, itemId, flyerIdx = 0, isNewItemModal = false) {
       const booth = state.events[state.activeEventId].booths[boothId];
       const flyers = getBoothFlyers(booth);
-      if (flyers.length === 0 || !getImageSrc(flyers[0].url)) return alert('此攤位尚未上傳或黏貼攤位宣傳圖！');
+      if (flyers.length === 0 || !flyers[0].url) return alert('此攤位尚未上傳或黏貼攤位宣傳圖！');
       cropState = { boothId, itemId, flyerIdx: Math.min(flyerIdx, flyers.length - 1), isNewItemModal, box: { x: 20, y: 20, w: 50, h: 50 } };
       renderCropModal();
     }
@@ -4011,37 +3889,38 @@
       window.addEventListener('touchend', onEnd);
     }
 
-      const croppedUrl = await compressImageDataUrl(canvas.toDataURL('image/jpeg', 0.8), IMAGE_PRESETS.item.maxWidth, IMAGE_PRESETS.item.quality);
+    async function confirmCropImage() {
+      const img = document.getElementById('crop-source-img');
+      if (!img) return;
+      const { boothId, itemId, isNewItemModal, box } = cropState;
+      const canvas = document.createElement('canvas');
+      const natW = img.naturalWidth, natH = img.naturalHeight;
+      const sx = (box.x / 100) * natW, sy = (box.y / 100) * natH;
+      const sw = (box.w / 100) * natW, sh = (box.h / 100) * natH;
+      canvas.width = sw; canvas.height = sh;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+
+      const croppedUrl = await compressImageDataUrl(canvas.toDataURL('image/jpeg', 0.8), 720, 0.72);
       if (isNewItemModal) {
         tempNewItemImageData = croppedUrl;
         openNewItemModal(boothId);
       } else {
-        const item = state.events[state.activeEventId]?.booths?.[boothId]?.items?.[itemId];
-        if (!item) { closeModal(); return; }
-        item.itemImage = await externalizeLargeImage(croppedUrl);
-        const itemPath = `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`;
-        await saveData(false, itemPath, item);
-        closeModal();
+        state.events[state.activeEventId].booths[boothId].items[itemId].itemImage = croppedUrl;
+        await saveData(); closeModal(); render();
       }
+    }
 
     function updateBoughtQty(boothId, itemId, member, delta) {
-      const booth = state.events[state.activeEventId]?.booths?.[boothId];
-      const item = booth?.items?.[itemId];
-      if (!item) return;
-
+      const item = state.events[state.activeEventId].booths[boothId].items[itemId];
       if (item.divisionCompleted) item.divisionCompleted = false;
-      if (!item.orders) item.orders = {};
       if (!item.orders[member]) item.orders[member] = { req: 0, bought: 0 };
-
       const nextVal = Math.max(0, (item.orders[member].bought || 0) + delta);
       item.orders[member].bought = nextVal;
-
       const allMet = Object.values(item.orders).every(o => (o.bought || 0) >= (o.req || 0));
       if (allMet && nextVal > 0) item.status = 'done';
       else if (item.status === 'done' && !allMet) item.status = 'pending';
-
-      const itemPath = `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`;
-      saveData(false, itemPath, item);
+      saveData();
     }
 
     function setItemStatus(boothId, itemId, status) {
@@ -4633,18 +4512,14 @@
     async function handleMapUpload(e) {
       const file = e.target.files[0];
       if (!file) return;
-      const ev = state.events[state.activeEventId];
-      if (!ev) return;
-      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.eventMap.maxWidth, IMAGE_PRESETS.eventMap.quality);
-      ev.mapImage = await externalizeLargeImage(compressed);
-      closeModal();
-      const mapPath = `events/${state.activeEventId}/mapImage`;
-      await saveData(false, mapPath, ev.mapImage);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 1100, 0.75);
+      state.events[state.activeEventId].mapImage = compressed;
+      closeModal(); await saveData(); render();
     }
 
     function openMapPinModal(boothId) {
       const currentEv = state.events[state.activeEventId];
-      if (!getImageSrc(currentEv.mapImage)) return alert('請先在「編輯模式」上傳會場地圖圖片！');
+      if (!currentEv.mapImage) return alert('請先在「編輯模式」上傳會場地圖圖片！');
       const booth = currentEv.booths[boothId];
       showModal(`
         <div class="flex justify-between items-center mb-2">
@@ -4652,7 +4527,7 @@
           <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
         </div>
         <div class="relative w-full overflow-auto border rounded-xl bg-gray-100" style="max-height: 60vh;">
-          <img id="pin-map-img" src="${getImageSrc(currentEv.mapImage)}" class="w-full h-auto block cursor-crosshair" onclick="setBoothPin(event, '${boothId}')" />
+          <img id="pin-map-img" src="${currentEv.mapImage}" class="w-full h-auto block cursor-crosshair" onclick="setBoothPin(event, '${boothId}')" />
           <div style="left: ${booth.x || 50}%; top: ${booth.y || 50}%;" class="absolute -translate-x-1/2 -translate-y-1/2 w-4 h-4 bg-[#D96B43] rounded-full ring-4 ring-white shadow-lg pointer-events-none"></div>
         </div>
       `);
