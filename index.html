@@ -1393,6 +1393,7 @@
                       <input type="file" accept="image/*" onchange="handleBoothMapUpload(event, '${b.id}')" class="hidden" />
                     </label>
                     <button type="button" onclick="pasteBoothMap('${b.id}')" class="py-2 px-3 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-lg text-xs font-bold shrink-0">黏貼</button>
+                    ${b.boothMapImage ? `<button type="button" onclick="clearBoothMap('${b.id}')" class="py-2 px-3 bg-red-50 text-red-600 rounded-lg text-xs font-bold shrink-0">清除</button>` : ''}
                   </div>
                 </div>
 
@@ -1413,6 +1414,7 @@
                           <div class="flex gap-2">
                             <label class="text-[10px] text-[#4A7C6F] font-bold cursor-pointer underline">更換圖片<input type="file" accept="image/*" onchange="handleSingleBoothFlyerUpload(event, '${b.id}', ${fIdx})" class="hidden" /></label>
                             <button type="button" onclick="pasteSingleBoothFlyer('${b.id}', ${fIdx})" class="text-[10px] text-[#4A7C6F] font-bold underline">黏貼圖片</button>
+                            ${getImageSrc(flyer.url) ? `<button type="button" onclick="clearSingleBoothFlyer('${b.id}', ${fIdx})" class="text-[10px] text-red-500 font-bold underline">清除圖片</button>` : ''}
                           </div>
                         </div>
                         <button type="button" onclick="removeBoothFlyer('${b.id}', ${fIdx})" class="text-red-400 text-xs px-1"><i class="fa-solid fa-trash"></i></button>
@@ -1573,6 +1575,7 @@
                           <i class="fa-solid fa-crop-simple mr-1"></i>截取
                         </button>
                         <button type="button" onclick="pasteItemImage('${b.id}', '${it.id}')" class="py-1.5 px-2.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-lg text-xs font-bold">黏貼</button>
+                        ${it.itemImage ? `<button type="button" onclick="clearItemImage('${b.id}', '${it.id}')" class="py-1.5 px-2.5 bg-red-50 text-red-600 rounded-lg text-xs font-bold">清除</button>` : ''}
                       </div>
                     </div>
                     <div class="pt-2 border-t border-gray-300/60">
@@ -3887,6 +3890,62 @@
       }
     }
 
+
+    async function clearBoothMap(boothId) {
+      const booth = state.events[state.activeEventId]?.booths?.[boothId];
+      if (!booth) return;
+      booth.boothMapImage = '';
+      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
+      await saveData(false, boothPath, booth);
+    }
+
+    async function clearSingleBoothFlyer(boothId, flyerIdx) {
+      const booth = state.events[state.activeEventId]?.booths?.[boothId];
+      if (!booth) return;
+      const flyers = getBoothFlyers(booth);
+      if (flyers[flyerIdx]) flyers[flyerIdx].url = '';
+      booth.flyerImages = flyers;
+      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
+      await saveData(false, boothPath, booth);
+    }
+
+    async function clearItemImage(boothId, itemId) {
+      const item = state.events[state.activeEventId]?.booths?.[boothId]?.items?.[itemId];
+      if (!item) return;
+      item.itemImage = '';
+      const itemPath = `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`;
+      await saveData(false, itemPath, item);
+    }
+
+    function clearNewBoothMap() {
+      tempNewBoothMapData = '';
+      const preview = document.getElementById('new-b-map-preview');
+      if (preview) preview.innerHTML = '無圖';
+    }
+
+    function clearNewModalFlyerImg(btn) {
+      const itemBox = btn.closest('.new-b-flyer-item')?.querySelector('.flyer-thumb-box');
+      if (itemBox) {
+        itemBox.dataset.url = '';
+        itemBox.innerHTML = '無圖';
+      }
+    }
+
+    function clearNewItemImage() {
+      tempNewItemImageData = '';
+      const preview = document.getElementById('new-it-img-preview');
+      if (preview) preview.innerHTML = '無圖';
+    }
+
+    async function clearEventMap() {
+      const ev = state.events[state.activeEventId];
+      if (!ev) return;
+      ev.mapImage = '';
+      closeModal();
+      const mapPath = `events/${state.activeEventId}/mapImage`;
+      await saveData(false, mapPath, '');
+    }
+
     function removeBoothFlyer(boothId, flyerIdx) {
       const booth = state.events[state.activeEventId]?.booths?.[boothId];
       if (!booth) return;
@@ -4322,6 +4381,7 @@
                 <input type="file" accept="image/*" onchange="handleNewBoothMapUpload(event)" class="hidden" />
               </label>
               <button type="button" onclick="pasteNewBoothMap()" class="py-2 px-3 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-lg text-xs font-bold shrink-0">黏貼</button>
+              <button type="button" onclick="clearNewBoothMap()" class="py-2 px-3 bg-red-50 text-red-600 rounded-lg text-xs font-bold shrink-0">清除</button>
             </div>
           </div>
 
@@ -4395,6 +4455,7 @@
             <div class="flex gap-2">
               <label class="text-[10px] text-[#4A7C6F] font-bold cursor-pointer underline">選擇圖片<input type="file" accept="image/*" onchange="handleNewModalFlyerFile(event, this)" class="hidden" /></label>
               <button type="button" onclick="pasteNewModalFlyerImg(this)" class="text-[10px] text-[#4A7C6F] font-bold underline">黏貼圖片</button>
+              <button type="button" onclick="clearNewModalFlyerImg(this)" class="text-[10px] text-red-500 font-bold underline">清除圖片</button>
             </div>
           </div>
           <button type="button" onclick="removeThisParent(this.parentElement)" class="text-red-400 text-xs px-1"><i class="fa-solid fa-trash"></i></button>
@@ -4559,6 +4620,7 @@
                 <i class="fa-solid fa-crop-simple mr-1"></i>截取
               </button>
               <button type="button" onclick="pasteNewItemImage()" class="py-2 px-2.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-lg text-xs font-bold">黏貼</button>
+              <button type="button" onclick="clearNewItemImage()" class="py-2 px-2.5 bg-red-50 text-red-600 rounded-lg text-xs font-bold">清除</button>
             </div>
           </div>
 
@@ -4646,6 +4708,7 @@
         </div>
         <p class="text-xs text-gray-500 mb-3">選擇手機相簿中的場地圖，上傳後即可在「跑攤模式」標記各攤位座標位置。</p>
         <input type="file" accept="image/*" onchange="handleMapUpload(event)" class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-bold file:bg-[#4A7C6F]/10 file:text-[#4A7C6F]" />
+        ${state.events[state.activeEventId]?.mapImage ? `<button type="button" onclick="clearEventMap()" class="w-full mt-3 py-2.5 rounded-xl bg-red-50 text-red-600 text-xs font-bold">清除目前會場地圖</button>` : ''}
       `);
     }
 
