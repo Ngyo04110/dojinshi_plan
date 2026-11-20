@@ -345,7 +345,8 @@
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden') {
-        persistStateLocally(hasPendingLocalChanges);
+        const meaningful = hasAnyMeaningfulData(getPersistablePayload());
+        persistStateLocally(meaningful && hasPendingLocalChanges);
       } else if (document.visibilityState === 'visible' && useFirebase && db) {
         try { db.goOnline(); } catch (e) {}
         if (hasCloudInitialLoadCompleted) {
@@ -484,6 +485,10 @@
             applyLoadedData(parsed);
             hasLocalCache = true;
             localCacheMeaningful = hasAnyMeaningfulData(parsed);
+            if (!localCacheMeaningful) {
+              hasPendingLocalChanges = false;
+              safeSetStorage(LOCAL_PENDING_KEY, 'false');
+            }
             const localStats = countDataStats(parsed);
             if (localStats.eventsCount > lastKnownCloudStats.eventsCount || localStats.boothsCount > lastKnownCloudStats.boothsCount) {
               saveKnownCloudStats(localStats);
@@ -558,8 +563,8 @@
             persistStateLocally(false);
             updateSyncBadge('synced', '已連線');
           } else if (!hasLocalCache && !localCacheMeaningful && isFirstCloudResponse) {
-            // 僅在確認雲端與本地皆完全無資料時才建立初始資料
-            seedInitialData();
+            // 雲端目前為空且無本地快取：僅在本地顯示空白狀態，絕不自動寫入假資料或空資料覆蓋雲端
+            updateSyncBadge('synced', '已連線（雲端目前無資料）');
           } else if (!cloudMeaningful && (localCacheMeaningful || lastKnownCloudStats.eventsCount > 0 || lastKnownCloudStats.boothsCount > 0)) {
             // 雲端突然變為空資料，但本地/歷史紀錄曾有資料：不覆蓋本地，並嘗試從備份或阻止空覆蓋
             const backupRaw = safeGetStorage(LOCAL_CLOUD_SNAPSHOT_KEY) || safeGetStorage('doujin_planner_backup');
@@ -620,12 +625,20 @@
       return JSON.parse(JSON.stringify(obj, (k, v) => v === undefined ? null : v));
     }
 
-    function saveData() {
-      persistStateLocally(true);
+    function saveData(allowEmptyOverwrite = false) {
+      const payloadCheck = getPersistablePayload();
+      const meaningful = hasAnyMeaningfulData(payloadCheck);
+      persistStateLocally(meaningful || allowEmptyOverwrite);
       render(); // 確保所有狀態變更（包含預覽大小、數量增減）立即刷新畫面
       if (useFirebase && db) {
+        if (!meaningful && !allowEmptyOverwrite) {
+          hasPendingLocalChanges = false;
+          safeSetStorage(LOCAL_PENDING_KEY, 'false');
+          updateSyncBadge('error', '本地為空 · 已禁止寫入雲端');
+          return;
+        }
         updateSyncBadge('pending', '本地已存 · 同步中');
-        syncToCloudIfNeeded(false);
+        syncToCloudIfNeeded(false, allowEmptyOverwrite);
       } else {
         const nowStr = formatClockTime();
         safeSetStorage(LOCAL_LAST_SAVED_KEY, nowStr);
@@ -657,9 +670,19 @@
       const payload = getPersistablePayload();
       const localStats = countDataStats(payload);
 
-      // 防護 2：若雲端/歷史紀錄原本有資料，而本地準備上傳的資料變成「0 活動或 0 攤位」，自動攔截防止覆蓋
+      // 防護 2（絕對鐵律）：如果本地完全沒有任何有效資料（0 活動、0 攤位、0 收藏），絕對禁止自動寫入雲端！
+      if (!allowEmptyOverwrite && !hasAnyMeaningfulData(payload)) {
+        hasPendingLocalChanges = false;
+        safeSetStorage(LOCAL_PENDING_KEY, 'false');
+        updateSyncBadge('error', '已攔截空資料寫入');
+        return;
+      }
+
+      // 防護 3：若雲端/歷史紀錄原本有資料，而本地準備上傳的資料變成「0 活動或 0 攤位」，自動攔截並阻止覆蓋
       if (!allowEmptyOverwrite && (lastKnownCloudStats.eventsCount > 0 || lastKnownCloudStats.boothsCount > 0)) {
         if (localStats.eventsCount === 0 || (lastKnownCloudStats.boothsCount > 0 && localStats.boothsCount === 0)) {
+          hasPendingLocalChanges = false;
+          safeSetStorage(LOCAL_PENDING_KEY, 'false');
           updateSyncBadge('error', '已攔截空資料覆蓋');
           const shouldForce = confirm(
             `【⚠️ 防資料遺失保護】\n\n` +
@@ -4409,7 +4432,7 @@
         state.activeEventId = null;
         state.settleEventId = null;
       }
-      closeModal(); saveData(); render();
+      closeModal(); saveData(true); render();
       alert('已成功刪除該活動。');
     }
 
