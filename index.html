@@ -38,7 +38,6 @@
     .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
     .crop-box-shadow { box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55); }
     .search-dropdown { position: absolute; z-index: 50; background: white; border: 1px solid #e5e7eb; border-radius: 0.75rem; box-shadow: 0 4px 12px rgba(0,0,0,0.08); max-height: 180px; overflow-y: auto; width: 100%; margin-top: 2px; }
-    /* 深一點的綠色商品方塊背景與邊框 */
     .item-box-deep-green {
       background-color: #DCE8E3;
       border: 1px solid #B5CEC4;
@@ -115,7 +114,7 @@
 
   <script>
     // ==========================================
-    // 1. FIREBASE, OFFLINE QUEUE & STATE
+    // 1. FIREBASE, INDEXEDDB STORAGE & SYNC GUARD
     // ==========================================
     const firebaseConfig = {
       apiKey: "AIzaSyDh14SJnzzIeH9mW0so9_R5Xjk1dPdy_P4",
@@ -128,9 +127,68 @@
       measurementId: "G-90RQWWLFT6"
     };
 
-    const LOCAL_STATE_KEY = 'doujin_planner_local_state_v2';
-    const LOCAL_PENDING_KEY = 'doujin_planner_pending_sync_v2';
-    const LOCAL_LAST_SAVED_KEY = 'doujin_planner_last_saved_v2';
+    const LOCAL_STATE_KEY = 'doujin_planner_local_state_v3';
+    const LOCAL_PENDING_KEY = 'doujin_planner_pending_sync_v3';
+    const LOCAL_PENDING_TS_KEY = 'doujin_planner_pending_ts_v3';
+    const LOCAL_LAST_SAVED_KEY = 'doujin_planner_last_saved_v3';
+    const LOCAL_CLOUD_STATS_KEY = 'doujin_planner_last_cloud_stats_v3';
+    const LOCAL_CLOUD_SNAPSHOT_KEY = 'doujin_planner_last_cloud_snapshot_v3';
+
+    // 大容量 IndexedDB 封裝（徹底解決手機貼圖超過 localStorage 5MB 上限導致殘留舊快取的問題）
+    const AppLocalDB = {
+      dbName: 'DoujinPlannerIDB_v1',
+      storeName: 'kvStore',
+      _dbPromise: null,
+      open() {
+        if (this._dbPromise) return this._dbPromise;
+        this._dbPromise = new Promise((resolve) => {
+          if (!window.indexedDB) { resolve(null); return; }
+          try {
+            const req = indexedDB.open(this.dbName, 1);
+            req.onupgradeneeded = (e) => {
+              const idb = e.target.result;
+              if (!idb.objectStoreNames.contains(this.storeName)) {
+                idb.createObjectStore(this.storeName);
+              }
+            };
+            req.onsuccess = (e) => resolve(e.target.result);
+            req.onerror = () => resolve(null);
+          } catch (e) {
+            resolve(null);
+          }
+        });
+        return this._dbPromise;
+      },
+      async get(key) {
+        const idb = await this.open();
+        if (!idb) return safeGetStorage(key);
+        return new Promise((resolve) => {
+          try {
+            const tx = idb.transaction(this.storeName, 'readonly');
+            const req = tx.objectStore(this.storeName).get(key);
+            req.onsuccess = () => resolve(req.result !== undefined ? req.result : safeGetStorage(key));
+            req.onerror = () => resolve(safeGetStorage(key));
+          } catch (e) {
+            resolve(safeGetStorage(key));
+          }
+        });
+      },
+      async set(key, val) {
+        let lsOk = safeSetStorage(key, val);
+        const idb = await this.open();
+        if (!idb) return lsOk;
+        return new Promise((resolve) => {
+          try {
+            const tx = idb.transaction(this.storeName, 'readwrite');
+            tx.objectStore(this.storeName).put(val, key);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(lsOk);
+          } catch (e) {
+            resolve(lsOk);
+          }
+        });
+      }
+    };
 
     let useFirebase = false;
     let db = null;
@@ -146,35 +204,62 @@
 
     let isUploadingToCloud = false;
     let hasPendingLocalChanges = false;
+    let localPendingTimestamp = 0;
+    let localStateUpdatedAt = 0;
     let isFirebaseConnected = false;
     let uploadSequence = 0;
 
-    // 雲端載入完成鎖與雲端資料統計，防止未載入完成或空資料覆蓋雲端
     let hasCloudInitialLoadCompleted = false;
-    let lastKnownCloudStats = { eventsCount: 0, boothsCount: 0 };
+    let lastKnownCloudStats = { eventsCount: 0, boothsCount: 0, itemsCount: 0, imagesCount: 0, updatedAt: 0 };
 
-    const LOCAL_CLOUD_STATS_KEY = 'doujin_planner_last_cloud_stats_v2';
-    const LOCAL_CLOUD_SNAPSHOT_KEY = 'doujin_planner_last_cloud_snapshot_v2';
+    function safeGetStorage(key) {
+      try { return window.localStorage ? localStorage.getItem(key) : null; } catch (e) { return null; }
+    }
+    function safeSetStorage(key, val) {
+      try {
+        if (window.localStorage) {
+          localStorage.setItem(key, val);
+          return true;
+        }
+        return false;
+      } catch (e) {
+        return false;
+      }
+    }
 
     function countDataStats(dataObj) {
       if (!dataObj || !dataObj.events || typeof dataObj.events !== 'object') {
-        return { eventsCount: 0, boothsCount: 0, itemsCount: 0 };
+        return { eventsCount: 0, boothsCount: 0, itemsCount: 0, imagesCount: 0, updatedAt: Number(dataObj && dataObj.updatedAt) || 0 };
       }
       const evValues = Object.values(dataObj.events).filter(Boolean);
       let boothsCount = 0;
       let itemsCount = 0;
+      let imagesCount = 0;
       evValues.forEach(ev => {
+        if (ev.mapImage) imagesCount++;
         if (ev && ev.booths && typeof ev.booths === 'object') {
           const bList = Object.values(ev.booths).filter(Boolean);
           boothsCount += bList.length;
           bList.forEach(b => {
+            if (b.boothMapImage) imagesCount++;
+            if (Array.isArray(b.flyerImages)) {
+              b.flyerImages.forEach(f => { if (f && f.url) imagesCount++; });
+            }
             if (b && b.items && typeof b.items === 'object') {
-              itemsCount += Object.values(b.items).filter(Boolean).length;
+              const itList = Object.values(b.items).filter(Boolean);
+              itemsCount += itList.length;
+              itList.forEach(it => { if (it.itemImage) imagesCount++; });
             }
           });
         }
       });
-      return { eventsCount: evValues.length, boothsCount, itemsCount };
+      return {
+        eventsCount: evValues.length,
+        boothsCount,
+        itemsCount,
+        imagesCount,
+        updatedAt: Number(dataObj.updatedAt) || 0
+      };
     }
 
     function saveKnownCloudStats(stats) {
@@ -182,7 +267,9 @@
       lastKnownCloudStats = {
         eventsCount: stats.eventsCount || 0,
         boothsCount: stats.boothsCount || 0,
-        itemsCount: stats.itemsCount || 0
+        itemsCount: stats.itemsCount || 0,
+        imagesCount: stats.imagesCount || 0,
+        updatedAt: stats.updatedAt || 0
       };
       safeSetStorage(LOCAL_CLOUD_STATS_KEY, JSON.stringify(lastKnownCloudStats));
     }
@@ -196,7 +283,9 @@
           lastKnownCloudStats = {
             eventsCount: parsed.eventsCount || 0,
             boothsCount: parsed.boothsCount || 0,
-            itemsCount: parsed.itemsCount || 0
+            itemsCount: parsed.itemsCount || 0,
+            imagesCount: parsed.imagesCount || 0,
+            updatedAt: parsed.updatedAt || 0
           };
         }
       } catch (e) {}
@@ -208,6 +297,13 @@
       if (stats.eventsCount > 0 || stats.boothsCount > 0 || stats.itemsCount > 0) return true;
       if (Array.isArray(payload.favorites) && payload.favorites.length > 0) return true;
       return false;
+    }
+
+    function clearPendingFlag() {
+      hasPendingLocalChanges = false;
+      localPendingTimestamp = 0;
+      safeSetStorage(LOCAL_PENDING_KEY, 'false');
+      safeSetStorage(LOCAL_PENDING_TS_KEY, '0');
     }
 
     function updateManualSyncButtonState() {
@@ -224,33 +320,31 @@
       }
     }
 
-    function forcePullFromCloud() {
+    async function forcePullFromCloud() {
       if (!useFirebase || !db) return alert('目前為單機模式，無雲端資料可下載。');
-      if (!confirm('確定要放棄本地未同步的變更，直接從雲端重新下載最新資料嗎？')) return;
       setLoadingOverlay(true, '正在從雲端重新下載資料...');
-      db.ref('doujinPlanner').once('value')
-        .then((snapshot) => {
-          setLoadingOverlay(false);
-          const val = snapshot.val();
-          if (val && hasAnyMeaningfulData(val)) {
-            hasPendingLocalChanges = false;
-            safeSetStorage(LOCAL_PENDING_KEY, 'false');
-            applyLoadedData(val);
-            saveKnownCloudStats(countDataStats(val));
-            safeSetStorage(LOCAL_CLOUD_SNAPSHOT_KEY, JSON.stringify(sanitizeForFirebase(val)));
-            persistStateLocally(false);
-            hasCloudInitialLoadCompleted = true;
-            updateManualSyncButtonState();
-            updateSyncBadge('synced', '已從雲端還原');
-            render();
-          } else {
-            alert('雲端目前沒有任何有效資料，已保留目前本地資料。');
-          }
-        })
-        .catch((err) => {
-          setLoadingOverlay(false);
-          alert('從雲端下載失敗，請檢查網路連線：' + err.message);
-        });
+      try {
+        const snapshot = await db.ref('doujinPlanner').once('value');
+        setLoadingOverlay(false);
+        const val = snapshot.val();
+        if (val && hasAnyMeaningfulData(val)) {
+          clearPendingFlag();
+          applyLoadedData(val);
+          saveKnownCloudStats(countDataStats(val));
+          const serialized = JSON.stringify(sanitizeForFirebase(val));
+          await AppLocalDB.set(LOCAL_CLOUD_SNAPSHOT_KEY, serialized);
+          await persistStateLocally(false);
+          hasCloudInitialLoadCompleted = true;
+          updateManualSyncButtonState();
+          updateSyncBadge('synced', '已從雲端還原');
+          render();
+        } else {
+          alert('雲端目前沒有任何有效資料，已保留目前本地資料。');
+        }
+      } catch (err) {
+        setLoadingOverlay(false);
+        alert('從雲端下載失敗，請檢查網路連線：' + err.message);
+      }
     }
 
     function setLoadingOverlay(visible, text = '正在載入資料...') {
@@ -300,6 +394,7 @@
       }
     }
 
+    // 統一圖片壓縮工具（支援 DataURL、File、Clipboard Blob）
     function compressImageDataUrl(dataUrl, maxWidth = 720, quality = 0.72) {
       return new Promise((resolve) => {
         if (!dataUrl || !dataUrl.startsWith('data:image/')) {
@@ -331,7 +426,7 @@
       });
     }
 
-    function readFileAsCompressedDataUrl(file, maxWidth = 720, quality = 0.72) {
+    function readBlobOrFileAsCompressedDataUrl(fileOrBlob, maxWidth = 720, quality = 0.72) {
       return new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = async (evt) => {
@@ -339,7 +434,7 @@
           resolve(compressed);
         };
         reader.onerror = reject;
-        reader.readAsDataURL(file);
+        reader.readAsDataURL(fileOrBlob);
       });
     }
 
@@ -396,15 +491,10 @@
 
     let currentOpenMemberModal = null;
 
-    function safeGetStorage(key) {
-      try { return window.localStorage ? localStorage.getItem(key) : null; } catch (e) { return null; }
-    }
-    function safeSetStorage(key, val) {
-      try { if (window.localStorage) localStorage.setItem(key, val); } catch (e) { console.warn("本地儲存空間不足或不可用：", e); }
-    }
-
-    function getPersistablePayload() {
+    function getPersistablePayload(customUpdatedAt = null) {
+      const ts = customUpdatedAt || localStateUpdatedAt || Date.now();
       return sanitizeForFirebase({
+        updatedAt: ts,
         members: state.members,
         favorites: state.favorites,
         events: state.events,
@@ -418,22 +508,34 @@
       });
     }
 
-    function persistStateLocally(markPending = true) {
-      const payload = getPersistablePayload();
-      const serialized = JSON.stringify(payload);
-      safeSetStorage(LOCAL_STATE_KEY, serialized);
-      // 同時保留一份最新有效狀態備份，防止意外清空
-      if (hasAnyMeaningfulData(payload)) {
-        safeSetStorage('doujin_planner_backup', serialized);
-      }
+    async function persistStateLocally(markPending = true) {
       if (markPending) {
-        hasPendingLocalChanges = true;
-        safeSetStorage(LOCAL_PENDING_KEY, 'true');
+        localStateUpdatedAt = Date.now();
       }
+      const payload = getPersistablePayload(localStateUpdatedAt);
+      const serialized = JSON.stringify(payload);
+      const savedOk = await AppLocalDB.set(LOCAL_STATE_KEY, serialized);
+
+      if (hasAnyMeaningfulData(payload)) {
+        await AppLocalDB.set('doujin_planner_backup_v3', serialized);
+      }
+
+      // 只有在本地資料「確實成功寫入 IndexedDB/localStorage」時，才允許標記待同步，絕不留下殘留舊快取卻標記待同步的狀態！
+      if (markPending && savedOk) {
+        hasPendingLocalChanges = true;
+        localPendingTimestamp = localStateUpdatedAt;
+        safeSetStorage(LOCAL_PENDING_KEY, 'true');
+        safeSetStorage(LOCAL_PENDING_TS_KEY, String(localPendingTimestamp));
+      } else if (!savedOk) {
+        console.warn('本地快取寫入受限，已取消標記離線待同步以免殘留舊資料覆蓋雲端');
+        clearPendingFlag();
+      }
+      return savedOk;
     }
 
     function applyLoadedData(val) {
       if (!val || typeof val !== 'object') return;
+      localStateUpdatedAt = Number(val.updatedAt) || Date.now();
       state.members = Array.isArray(val.members) && val.members.length > 0 ? val.members : ['麻油'];
       state.favorites = Array.isArray(val.favorites) ? val.favorites : [];
       state.events = (val.events && typeof val.events === 'object') ? val.events : {};
@@ -465,7 +567,7 @@
       return cur.symbol + (amount || 0).toLocaleString();
     }
 
-    function initData() {
+    async function initData() {
       setLoadingOverlay(true, '正在載入資料...');
       loadKnownCloudStats();
       updateManualSyncButtonState();
@@ -473,8 +575,13 @@
       const savedLastTime = safeGetStorage(LOCAL_LAST_SAVED_KEY);
       if (savedLastTime) updateLastSavedDisplay(savedLastTime);
 
-      const cachedRaw = safeGetStorage(LOCAL_STATE_KEY) || safeGetStorage('doujin_planner_backup') || safeGetStorage('doujin_planner_demo');
+      const cachedRaw = (await AppLocalDB.get(LOCAL_STATE_KEY))
+        || (await AppLocalDB.get('doujin_planner_backup_v3'))
+        || safeGetStorage('doujin_planner_local_state_v2')
+        || safeGetStorage('doujin_planner_backup');
+
       hasPendingLocalChanges = safeGetStorage(LOCAL_PENDING_KEY) === 'true';
+      localPendingTimestamp = Number(safeGetStorage(LOCAL_PENDING_TS_KEY)) || 0;
       let hasLocalCache = false;
       let localCacheMeaningful = false;
 
@@ -486,15 +593,13 @@
             hasLocalCache = true;
             localCacheMeaningful = hasAnyMeaningfulData(parsed);
             if (!localCacheMeaningful) {
-              hasPendingLocalChanges = false;
-              safeSetStorage(LOCAL_PENDING_KEY, 'false');
+              clearPendingFlag();
             }
             const localStats = countDataStats(parsed);
             if (localStats.eventsCount > lastKnownCloudStats.eventsCount || localStats.boothsCount > lastKnownCloudStats.boothsCount) {
               saveKnownCloudStats(localStats);
             }
             render();
-            // 若有本地快取，先顯示畫面但保持 hasCloudInitialLoadCompleted = false，直到雲端回應確認
             setLoadingOverlay(false);
           }
         } catch (e) {
@@ -516,7 +621,7 @@
           }
         });
 
-        db.ref('doujinPlanner').on('value', (snapshot) => {
+        db.ref('doujinPlanner').on('value', async (snapshot) => {
           setLoadingOverlay(false);
           const val = snapshot.val();
           const cloudMeaningful = hasAnyMeaningfulData(val);
@@ -524,10 +629,9 @@
 
           if (cloudMeaningful) {
             saveKnownCloudStats(cloudStats);
-            safeSetStorage(LOCAL_CLOUD_SNAPSHOT_KEY, JSON.stringify(sanitizeForFirebase(val)));
+            await AppLocalDB.set(LOCAL_CLOUD_SNAPSHOT_KEY, JSON.stringify(sanitizeForFirebase(val)));
           }
 
-          // 首次從雲端取得回應，解除寫入鎖定
           const isFirstCloudResponse = !hasCloudInitialLoadCompleted;
           hasCloudInitialLoadCompleted = true;
           updateManualSyncButtonState();
@@ -536,22 +640,36 @@
             return;
           }
 
-          // 若本地有待同步變更：
-          // 1) 若雲端有有效資料且比本地更完整（例如重開機／跨裝置剛更新），優先合併或保留有效資料，避免空本地覆蓋雲端
+          // 若本地標記有待同步變更，先比對「雲端與本地誰才是真正較新／較完整的資料」
           if (hasPendingLocalChanges) {
             const currentPayload = getPersistablePayload();
             const currentStats = countDataStats(currentPayload);
+
+            // 情況 1：本地無有效資料但雲端有資料 -> 直接採納雲端，清除錯誤待同步旗標
             if (!hasAnyMeaningfulData(currentPayload) && cloudMeaningful) {
-              // 本地目前為空但雲端有資料：直接套用雲端資料並清除錯誤的待同步旗標
-              hasPendingLocalChanges = false;
-              safeSetStorage(LOCAL_PENDING_KEY, 'false');
+              clearPendingFlag();
               applyLoadedData(val);
-              persistStateLocally(false);
+              await persistStateLocally(false);
               updateSyncBadge('synced', '已同步雲端資料');
               render();
               return;
             }
-            // 若本地有實際變更且有效，推播到雲端
+
+            // 情況 2：雲端時間戳記比本地更新，或雲端攤位／圖片數多於本地（代表跨裝置已更新成功，本地只是殘留舊快取）
+            if (cloudMeaningful && (
+              (cloudStats.updatedAt > 0 && currentStats.updatedAt > 0 && cloudStats.updatedAt >= currentStats.updatedAt) ||
+              (cloudStats.boothsCount > currentStats.boothsCount) ||
+              (cloudStats.boothsCount === currentStats.boothsCount && cloudStats.itemsCount === currentStats.itemsCount && cloudStats.imagesCount > currentStats.imagesCount)
+            )) {
+              clearPendingFlag();
+              applyLoadedData(val);
+              await persistStateLocally(false);
+              updateSyncBadge('synced', '已自動同步雲端最新進度');
+              render();
+              return;
+            }
+
+            // 情況 3：確認本地確實有尚未上傳的新變更且有效 -> 推播到雲端
             if (hasAnyMeaningfulData(currentPayload)) {
               syncToCloudIfNeeded(false);
               return;
@@ -560,21 +678,18 @@
 
           if (cloudMeaningful) {
             applyLoadedData(val);
-            persistStateLocally(false);
+            await persistStateLocally(false);
             updateSyncBadge('synced', '已連線');
           } else if (!hasLocalCache && !localCacheMeaningful && isFirstCloudResponse) {
-            // 雲端目前為空且無本地快取：僅在本地顯示空白狀態，絕不自動寫入假資料或空資料覆蓋雲端
             updateSyncBadge('synced', '已連線（雲端目前無資料）');
           } else if (!cloudMeaningful && (localCacheMeaningful || lastKnownCloudStats.eventsCount > 0 || lastKnownCloudStats.boothsCount > 0)) {
-            // 雲端突然變為空資料，但本地/歷史紀錄曾有資料：不覆蓋本地，並嘗試從備份或阻止空覆蓋
-            const backupRaw = safeGetStorage(LOCAL_CLOUD_SNAPSHOT_KEY) || safeGetStorage('doujin_planner_backup');
+            const backupRaw = (await AppLocalDB.get(LOCAL_CLOUD_SNAPSHOT_KEY)) || (await AppLocalDB.get('doujin_planner_backup_v3'));
             if (!hasAnyMeaningfulData(getPersistablePayload()) && backupRaw) {
               try {
                 const backupObj = JSON.parse(backupRaw);
                 if (hasAnyMeaningfulData(backupObj)) {
                   applyLoadedData(backupObj);
-                  hasPendingLocalChanges = true;
-                  safeSetStorage(LOCAL_PENDING_KEY, 'true');
+                  await persistStateLocally(true);
                   updateSyncBadge('pending', '已從備份還原 · 待同步');
                   render();
                   return;
@@ -596,11 +711,10 @@
           const overlay = document.getElementById('loading-overlay');
           if (overlay && !overlay.classList.contains('hidden')) {
             setLoadingOverlay(false);
-            // 逾時未載入完成時，絕不呼叫 seedInitialData() 寫入雲端，保持唯讀保護
             updateSyncBadge('error', '連線逾時 · 已鎖定防覆蓋');
             render();
           }
-        }, 4000);
+        }, 4500);
 
         setInterval(() => {
           if (useFirebase && db) {
@@ -625,15 +739,16 @@
       return JSON.parse(JSON.stringify(obj, (k, v) => v === undefined ? null : v));
     }
 
-    function saveData(allowEmptyOverwrite = false) {
-      const payloadCheck = getPersistablePayload();
+    async function saveData(allowEmptyOverwrite = false) {
+      localStateUpdatedAt = Date.now();
+      const payloadCheck = getPersistablePayload(localStateUpdatedAt);
       const meaningful = hasAnyMeaningfulData(payloadCheck);
-      persistStateLocally(meaningful || allowEmptyOverwrite);
-      render(); // 確保所有狀態變更（包含預覽大小、數量增減）立即刷新畫面
+      render();
+      await persistStateLocally(meaningful || allowEmptyOverwrite);
+
       if (useFirebase && db) {
         if (!meaningful && !allowEmptyOverwrite) {
-          hasPendingLocalChanges = false;
-          safeSetStorage(LOCAL_PENDING_KEY, 'false');
+          clearPendingFlag();
           updateSyncBadge('error', '本地為空 · 已禁止寫入雲端');
           return;
         }
@@ -655,7 +770,6 @@
         return;
       }
 
-      // 防護 1：尚未完成雲端初次讀取前，禁止寫入雲端
       if (!hasCloudInitialLoadCompleted) {
         updateSyncBadge('pending', '等待雲端載入完成...');
         return;
@@ -667,22 +781,21 @@
         return;
       }
 
-      const payload = getPersistablePayload();
+      if (forceSync) {
+        localStateUpdatedAt = Date.now();
+      }
+      const payload = getPersistablePayload(localStateUpdatedAt);
       const localStats = countDataStats(payload);
 
-      // 防護 2（絕對鐵律）：如果本地完全沒有任何有效資料（0 活動、0 攤位、0 收藏），絕對禁止自動寫入雲端！
       if (!allowEmptyOverwrite && !hasAnyMeaningfulData(payload)) {
-        hasPendingLocalChanges = false;
-        safeSetStorage(LOCAL_PENDING_KEY, 'false');
+        clearPendingFlag();
         updateSyncBadge('error', '已攔截空資料寫入');
         return;
       }
 
-      // 防護 3：若雲端/歷史紀錄原本有資料，而本地準備上傳的資料變成「0 活動或 0 攤位」，自動攔截並阻止覆蓋
       if (!allowEmptyOverwrite && (lastKnownCloudStats.eventsCount > 0 || lastKnownCloudStats.boothsCount > 0)) {
         if (localStats.eventsCount === 0 || (lastKnownCloudStats.boothsCount > 0 && localStats.boothsCount === 0)) {
-          hasPendingLocalChanges = false;
-          safeSetStorage(LOCAL_PENDING_KEY, 'false');
+          clearPendingFlag();
           updateSyncBadge('error', '已攔截空資料覆蓋');
           const shouldForce = confirm(
             `【⚠️ 防資料遺失保護】\n\n` +
@@ -702,35 +815,19 @@
       const currentSeq = ++uploadSequence;
       updateSyncBadge('uploading', '同步雲端中...');
 
-      // 縮短 safetyTimer 至 5 秒，避免卡住後長期顯示「等待下次重試」
-      const safetyTimer = setTimeout(() => {
-        if (isUploadingToCloud && currentSeq === uploadSequence) {
-          isUploadingToCloud = false;
-          hasPendingLocalChanges = true;
-          safeSetStorage(LOCAL_PENDING_KEY, 'true');
-          try {
-            db.goOffline();
-            db.goOnline();
-          } catch (e) {}
-          updateSyncBadge('pending', '連線逾時 · 準備重試');
-        }
-      }, 5000);
-
-      // 加上 8 秒寫入逾時 Promise race，確保行動網路卡頓時不會無限掛起
+      // 給予行動網路充足的上傳時間（25 秒），避免大圖上傳到一半被提早切斷而留下假性待重試旗標
       const setPromise = db.ref('doujinPlanner').set(payload);
       const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('雲端寫入逾時')), 8000);
+        setTimeout(() => reject(new Error('雲端寫入逾時')), 25000);
       });
 
       Promise.race([setPromise, timeoutPromise])
-        .then(() => {
-          clearTimeout(safetyTimer);
+        .then(async () => {
           isUploadingToCloud = false;
           saveKnownCloudStats(localStats);
-          safeSetStorage(LOCAL_CLOUD_SNAPSHOT_KEY, JSON.stringify(payload));
+          await AppLocalDB.set(LOCAL_CLOUD_SNAPSHOT_KEY, JSON.stringify(payload));
           if (currentSeq === uploadSequence) {
-            hasPendingLocalChanges = false;
-            safeSetStorage(LOCAL_PENDING_KEY, 'false');
+            clearPendingFlag();
             const nowStr = formatClockTime();
             safeSetStorage(LOCAL_LAST_SAVED_KEY, nowStr);
             updateLastSavedDisplay(nowStr);
@@ -740,17 +837,17 @@
           }
         })
         .catch((err) => {
-          clearTimeout(safetyTimer);
           isUploadingToCloud = false;
           hasPendingLocalChanges = true;
           safeSetStorage(LOCAL_PENDING_KEY, 'true');
+          safeSetStorage(LOCAL_PENDING_TS_KEY, String(localStateUpdatedAt));
           console.warn('雲端背景同步暫時失敗，已保留於本地並將於 6 秒後自動重試:', err);
           updateSyncBadge('pending', '本地已存 · 待重試');
         });
     }
 
-    function manualReconnectAndSave() {
-      persistStateLocally(true);
+    async function manualReconnectAndSave() {
+      await persistStateLocally(true);
       if (useFirebase && db) {
         try {
           db.goOffline();
@@ -826,7 +923,6 @@
       saveData();
     }
 
-    // 常用標籤：已移除「既刊」和「新刊」
     function getTopTags() {
       const excluded = ['既刊', '新刊'];
       const counts = {};
@@ -1249,8 +1345,6 @@
                 const tagsHtml = tagsArr.map(t => `<span class="inline-block bg-[#4A7C6F] text-white text-[10px] font-bold px-1.5 py-0.5 rounded mr-1">#${t}</span>`).join('');
                 const imgSizeClass = state.itemImageMode === 'small' ? 'w-10 h-10' : state.itemImageMode === 'large' ? 'w-24 h-24' : 'w-16 h-16';
                 const itemAuthors = getItemAuthors(it);
-
-                // 將攤位作者與商品已選作者合併，確保新加入的作者會顯示在勾選格中
                 const allCandidateAuthors = [...new Set([...authors.map(a => a.name), ...itemAuthors])].filter(Boolean);
 
                 return isEditingItem ? `
@@ -1397,23 +1491,9 @@
       }
     }
 
-    function setItemImageMode(mode) {
-      state.itemImageMode = mode;
-      render();
-      saveData();
-    }
-
-    function setRunImageMode(mode) {
-      state.runImageMode = mode;
-      render();
-      saveData();
-    }
-
-    function changeEditSortMode(val) {
-      state.sortMode = val;
-      saveData();
-      render();
-    }
+    function setItemImageMode(mode) { state.itemImageMode = mode; render(); saveData(); }
+    function setRunImageMode(mode) { state.runImageMode = mode; render(); saveData(); }
+    function changeEditSortMode(val) { state.sortMode = val; saveData(); render(); }
 
     function initDragAndDrop() {
       const container = document.getElementById('sortable-booth-list') || document.querySelector('main');
@@ -1437,12 +1517,7 @@
         let startY = 0;
         let isDragging = false;
 
-        const startDrag = (clientY) => {
-          startY = clientY;
-          draggedEl = card;
-          isDragging = false;
-        };
-
+        const startDrag = (clientY) => { startY = clientY; draggedEl = card; isDragging = false; };
         const moveDrag = (clientY) => {
           if (!draggedEl) return;
           if (Math.abs(clientY - startY) > 8 && !isDragging) {
@@ -1454,7 +1529,6 @@
             placeholder.style.height = draggedEl.offsetHeight + 'px';
             draggedEl.parentNode.insertBefore(placeholder, draggedEl.nextSibling);
           }
-
           if (isDragging) {
             draggedEl.style.top = (clientY - 30) + 'px';
             const siblings = [...draggedEl.parentNode.querySelectorAll('.booth-card:not([style*="fixed"])')];
@@ -1462,15 +1536,13 @@
               const rect = sib.getBoundingClientRect();
               return clientY < rect.top + rect.height / 2;
             });
-            if (nextSibling) {
-              nextSibling.parentNode.insertBefore(placeholder, nextSibling);
-            } else {
+            if (nextSibling) nextSibling.parentNode.insertBefore(placeholder, nextSibling);
+            else {
               const last = siblings[siblings.length - 1];
               if (last) last.parentNode.appendChild(placeholder);
             }
           }
         };
-
         const endDrag = () => {
           if (!draggedEl) return;
           if (isDragging) {
@@ -1490,7 +1562,6 @@
         handle.ontouchstart = (e) => { e.stopPropagation(); startDrag(e.touches[0].clientY); };
         window.ontouchmove = (e) => { if (draggedEl) { moveDrag(e.touches[0].clientY); e.preventDefault(); } };
         window.ontouchend = () => { endDrag(); };
-
         handle.onmousedown = (e) => { e.stopPropagation(); startDrag(e.clientY); };
         window.onmousemove = (e) => { if (draggedEl) { moveDrag(e.clientY); e.preventDefault(); } };
         window.onmouseup = () => { endDrag(); };
@@ -1501,17 +1572,13 @@
       const ev = state.events[state.activeEventId];
       if (!ev || !ev.booths) return;
       const runner = (state.sortMode !== 'custom' && state.sortMode !== 'az') ? state.sortMode : (state.activeRunner !== 'all' ? state.activeRunner : null);
-
       const cards = document.querySelectorAll('.booth-card');
       const newIds = Array.from(cards).map(c => c.dataset.boothId).filter(Boolean);
-
       if (runner) {
         if (!state.runnerOrders[ev.id]) state.runnerOrders[ev.id] = {};
         state.runnerOrders[ev.id][runner] = newIds;
       } else {
-        newIds.forEach((bId, idx) => {
-          if (ev.booths[bId]) ev.booths[bId].order = idx + 1;
-        });
+        newIds.forEach((bId, idx) => { if (ev.booths[bId]) ev.booths[bId].order = idx + 1; });
       }
       saveData();
       render();
@@ -1547,7 +1614,6 @@
     function executeOrderAction(boothId, action, val = 1) {
       const ev = state.events[state.activeEventId];
       if (!ev || !ev.booths) return;
-      
       const runner = (state.sortMode !== 'custom' && state.sortMode !== 'az') ? state.sortMode : (state.activeRunner !== 'all' ? state.activeRunner : null);
       if (runner) {
         if (!state.runnerOrders[ev.id]) state.runnerOrders[ev.id] = {};
@@ -1562,7 +1628,6 @@
         else if (action === 'bottom') targetIdx = list.length - 1;
         else if (action === 'up') targetIdx = Math.max(0, idx - val);
         else if (action === 'down') targetIdx = Math.min(list.length - 1, idx + val);
-
         if (targetIdx !== idx) {
           const moved = list.splice(idx, 1)[0];
           list.splice(targetIdx, 0, moved);
@@ -1577,14 +1642,12 @@
         else if (action === 'bottom') targetIdx = booths.length - 1;
         else if (action === 'up') targetIdx = Math.max(0, idx - val);
         else if (action === 'down') targetIdx = Math.min(booths.length - 1, idx + val);
-
         if (targetIdx !== idx) {
           const moved = booths.splice(idx, 1)[0];
           booths.splice(targetIdx, 0, moved);
           booths.forEach((b, i) => { ev.booths[b.id].order = i + 1; });
         }
       }
-
       closeModal();
       saveData();
       render();
@@ -1594,26 +1657,12 @@
       const val = inputEl.value.trim().toLowerCase();
       const dropdown = inputEl.parentElement.querySelector('.author-search-dropdown');
       if (!dropdown) return;
-
-      if (!val) {
-        dropdown.classList.add('hidden');
-        dropdown.innerHTML = '';
-        return;
-      }
-
+      if (!val) { dropdown.classList.add('hidden'); dropdown.innerHTML = ''; return; }
       const library = getAllAuthorsLibrary();
       const matched = library.filter(a => a.name.toLowerCase().includes(val));
-
-      if (matched.length === 0) {
-        dropdown.classList.add('hidden');
-        dropdown.innerHTML = '';
-        return;
-      }
-
+      if (matched.length === 0) { dropdown.classList.add('hidden'); dropdown.innerHTML = ''; return; }
       dropdown.innerHTML = matched.map(m => `
-        <div onclick="selectAuthorFromLibrary('${boothId}', ${authorIdx}, '${m.name.replace(/'/g, "\\'")}')" class="px-3 py-2 text-xs hover:bg-gray-100 cursor-pointer font-bold text-gray-800 border-b last:border-b-0">
-          ${m.name}
-        </div>
+        <div onclick="selectAuthorFromLibrary('${boothId}', ${authorIdx}, '${m.name.replace(/'/g, "\\'")}')" class="px-3 py-2 text-xs hover:bg-gray-100 cursor-pointer font-bold text-gray-800 border-b last:border-b-0">${m.name}</div>
       `).join('');
       dropdown.classList.remove('hidden');
     }
@@ -1623,10 +1672,8 @@
       if (!block) return;
       const nameInp = block.querySelector('input[type="text"]');
       if (nameInp) nameInp.value = authorName;
-
       const dropdown = block.querySelector('.author-search-dropdown');
       if (dropdown) { dropdown.classList.add('hidden'); dropdown.innerHTML = ''; }
-
       const library = getAllAuthorsLibrary();
       const foundAuth = library.find(a => a.name === authorName);
       if (foundAuth && foundAuth.links && foundAuth.links.length > 0) {
@@ -1639,26 +1686,12 @@
       const val = inputEl.value.trim().toLowerCase();
       const dropdown = inputEl.parentElement.querySelector('.author-search-dropdown');
       if (!dropdown) return;
-
-      if (!val) {
-        dropdown.classList.add('hidden');
-        dropdown.innerHTML = '';
-        return;
-      }
-
+      if (!val) { dropdown.classList.add('hidden'); dropdown.innerHTML = ''; return; }
       const library = getAllAuthorsLibrary();
       const matched = library.filter(a => a.name.toLowerCase().includes(val));
-
-      if (matched.length === 0) {
-        dropdown.classList.add('hidden');
-        dropdown.innerHTML = '';
-        return;
-      }
-
+      if (matched.length === 0) { dropdown.classList.add('hidden'); dropdown.innerHTML = ''; return; }
       dropdown.innerHTML = matched.map(m => `
-        <div onclick="selectNewAuthorFromLibrary(${authorIdx}, '${m.name.replace(/'/g, "\\'")}')" class="px-3 py-2 text-xs hover:bg-gray-100 cursor-pointer font-bold text-gray-800 border-b last:border-b-0">
-          ${m.name}
-        </div>
+        <div onclick="selectNewAuthorFromLibrary(${authorIdx}, '${m.name.replace(/'/g, "\\'")}')" class="px-3 py-2 text-xs hover:bg-gray-100 cursor-pointer font-bold text-gray-800 border-b last:border-b-0">${m.name}</div>
       `).join('');
       dropdown.classList.remove('hidden');
     }
@@ -1668,10 +1701,8 @@
       if (!block) return;
       const nameInp = block.querySelector('.new-b-author-name');
       if (nameInp) nameInp.value = authorName;
-
       const dropdown = block.querySelector('.author-search-dropdown');
       if (dropdown) { dropdown.classList.add('hidden'); dropdown.innerHTML = ''; }
-
       const library = getAllAuthorsLibrary();
       const found = library.find(a => a.name === authorName);
       if (found && found.links && found.links[0]) {
@@ -1680,31 +1711,16 @@
       }
     }
 
-    // 商品編輯時：即時搜尋作者庫
     function handleItemAuthorSearchInputLive(inputEl, boothId, itemId) {
       const val = inputEl.value.trim().toLowerCase();
       const dropdown = inputEl.parentElement.querySelector('.item-author-search-dropdown');
       if (!dropdown) return;
-
-      if (!val) {
-        dropdown.classList.add('hidden');
-        dropdown.innerHTML = '';
-        return;
-      }
-
+      if (!val) { dropdown.classList.add('hidden'); dropdown.innerHTML = ''; return; }
       const library = getAllAuthorsLibrary();
       const matched = library.filter(a => a.name.toLowerCase().includes(val));
-
-      if (matched.length === 0) {
-        dropdown.classList.add('hidden');
-        dropdown.innerHTML = '';
-        return;
-      }
-
+      if (matched.length === 0) { dropdown.classList.add('hidden'); dropdown.innerHTML = ''; return; }
       dropdown.innerHTML = matched.map(m => `
-        <div onclick="selectItemAuthorFromLibrary('${boothId}', '${itemId}', '${m.name.replace(/'/g, "\\'")}')" class="px-3 py-2 text-xs hover:bg-gray-100 cursor-pointer font-bold text-gray-800 border-b last:border-b-0">
-          ${m.name}
-        </div>
+        <div onclick="selectItemAuthorFromLibrary('${boothId}', '${itemId}', '${m.name.replace(/'/g, "\\'")}')" class="px-3 py-2 text-xs hover:bg-gray-100 cursor-pointer font-bold text-gray-800 border-b last:border-b-0">${m.name}</div>
       `).join('');
       dropdown.classList.remove('hidden');
     }
@@ -1731,7 +1747,6 @@
       }
     }
 
-    // 商品編輯時：點擊「+ 加入」即時將輸入的新作者加入勾選格
     function addInstantAuthorToEditItem(boothId, itemId) {
       const inp = document.getElementById(`edit-item-extra-author-inp-${itemId}`);
       if (!inp) return;
@@ -1740,31 +1755,16 @@
       selectItemAuthorFromLibrary(boothId, itemId, authorName);
     }
 
-    // 新增商品彈窗時：即時搜尋作者庫
     function handleNewItemAuthorSearchInputLive(inputEl) {
       const val = inputEl.value.trim().toLowerCase();
       const dropdown = inputEl.parentElement.querySelector('.new-item-author-search-dropdown');
       if (!dropdown) return;
-
-      if (!val) {
-        dropdown.classList.add('hidden');
-        dropdown.innerHTML = '';
-        return;
-      }
-
+      if (!val) { dropdown.classList.add('hidden'); dropdown.innerHTML = ''; return; }
       const library = getAllAuthorsLibrary();
       const matched = library.filter(a => a.name.toLowerCase().includes(val));
-
-      if (matched.length === 0) {
-        dropdown.classList.add('hidden');
-        dropdown.innerHTML = '';
-        return;
-      }
-
+      if (matched.length === 0) { dropdown.classList.add('hidden'); dropdown.innerHTML = ''; return; }
       dropdown.innerHTML = matched.map(m => `
-        <div onclick="selectNewItemAuthor('${m.name.replace(/'/g, "\\'")}')" class="px-3 py-2 text-xs hover:bg-gray-100 cursor-pointer font-bold text-gray-800 border-b last:border-b-0">
-          ${m.name}
-        </div>
+        <div onclick="selectNewItemAuthor('${m.name.replace(/'/g, "\\'")}')" class="px-3 py-2 text-xs hover:bg-gray-100 cursor-pointer font-bold text-gray-800 border-b last:border-b-0">${m.name}</div>
       `).join('');
       dropdown.classList.remove('hidden');
     }
@@ -1790,7 +1790,6 @@
       }
     }
 
-    // 新增商品彈窗時：點擊「+ 加入」即時將輸入的新作者加入勾選格
     function addInstantAuthorToNewItem() {
       const inp = document.getElementById('new-item-extra-author-input');
       if (!inp) return;
@@ -1811,7 +1810,6 @@
       }
 
       let html = renderEventTabBar(state.activeEventId);
-
       if (!currentEv) {
         html += `<div class="card p-8 text-center text-gray-400">請先在上方建立展會與攤位</div>`;
         container.innerHTML = html;
@@ -1938,7 +1936,6 @@
       booths.forEach((b, idx) => {
         const items = getSortedItems(b);
         const authors = getBoothAuthors(b);
-        
         const boothTotal = items.reduce((sum, it) => {
           const reqSum = Object.values(it.orders || {}).reduce((s, o) => s + (o.req || 0), 0);
           return sum + (it.price * reqSum);
@@ -2094,16 +2091,12 @@
       initDragAndDrop();
     }
 
-    function selectRunner(runnerName) {
-      state.activeRunner = runnerName;
-      render();
-    }
+    function selectRunner(runnerName) { state.activeRunner = runnerName; render(); }
 
     function openAddRunnerModal() {
       const evId = state.activeEventId;
       const existingRunners = (state.runnersByEvent && state.runnersByEvent[evId]) || [];
       const availableMembers = state.members.filter(m => !existingRunners.includes(m));
-
       showModal(`
         <div class="flex justify-between items-center mb-4">
           <h3 class="font-bold text-base">新建跑攤人</h3>
@@ -2115,14 +2108,11 @@
             ${availableMembers.length === 0 ? '<div class="text-xs text-gray-400">所有現有成員皆已加入跑攤人名單</div>' : `
               <div class="flex flex-wrap gap-2">
                 ${availableMembers.map(m => `
-                  <button type="button" onclick="confirmAddRunner('${m}')" class="px-3.5 py-1.5 rounded-full bg-[#4A7C6F]/10 text-[#4A7C6F] text-xs font-bold hover:bg-[#4A7C6F] hover:text-white transition">
-                    + ${m}
-                  </button>
+                  <button type="button" onclick="confirmAddRunner('${m}')" class="px-3.5 py-1.5 rounded-full bg-[#4A7C6F]/10 text-[#4A7C6F] text-xs font-bold hover:bg-[#4A7C6F] hover:text-white transition">+ ${m}</button>
                 `).join('')}
               </div>
             `}
           </div>
-
           <div class="pt-3 border-t">
             <label class="text-xs font-bold text-gray-700 block mb-1.5">2. 或即時輸入新成員並設為跑攤人：</label>
             <div class="flex gap-2">
@@ -2137,13 +2127,9 @@
     function confirmAddRunner(name) {
       const evId = state.activeEventId;
       if (!state.runnersByEvent[evId]) state.runnersByEvent[evId] = [];
-      if (!state.runnersByEvent[evId].includes(name)) {
-        state.runnersByEvent[evId].push(name);
-      }
+      if (!state.runnersByEvent[evId].includes(name)) state.runnersByEvent[evId].push(name);
       state.activeRunner = name;
-      closeModal();
-      saveData();
-      render();
+      closeModal(); saveData(); render();
     }
 
     function createAndAddRunner() {
@@ -2151,9 +2137,7 @@
       if (!inp) return;
       const name = inp.value.trim();
       if (!name) return alert('請輸入名稱');
-      if (!state.members.includes(name)) {
-        state.members.push(name);
-      }
+      if (!state.members.includes(name)) state.members.push(name);
       confirmAddRunner(name);
     }
 
@@ -2180,8 +2164,7 @@
       const evId = state.activeEventId;
       const removed = state.runnersByEvent[evId].splice(idx, 1)[0];
       if (state.activeRunner === removed) state.activeRunner = 'all';
-      saveData();
-      openEditRunnersModal();
+      saveData(); openEditRunnersModal();
     }
 
     function applyRunnerOrderPreset(type) {
@@ -2189,9 +2172,7 @@
       if (!runner || runner === 'all' || !type) return;
       const ev = state.events[state.activeEventId];
       if (!ev || !ev.booths) return;
-
       if (!state.runnerOrders[ev.id]) state.runnerOrders[ev.id] = {};
-
       if (type === 'default') {
         state.runnerOrders[ev.id][runner] = Object.values(ev.booths).sort((a, b) => (a.order || 0) - (b.order || 0)).map(b => b.id);
       } else if (type === 'az') {
@@ -2200,8 +2181,7 @@
         const otherOrder = state.runnerOrders[ev.id][type] || Object.values(ev.booths).sort((a, b) => (a.order || 0) - (b.order || 0)).map(b => b.id);
         state.runnerOrders[ev.id][runner] = [...otherOrder];
       }
-      saveData();
-      render();
+      saveData(); render();
     }
 
     function updateRunnerPurchaseQty(boothId, itemId, delta) {
@@ -2216,14 +2196,10 @@
         const actualDelta = next - prev;
         if (actualDelta === 0) return;
         item.purchasedBy[runner] = next;
-
         updateTotalBoughtQty(boothId, itemId, actualDelta, runner);
       } else {
-        if (delta > 0) {
-          openAllOverviewAddBuyerModal(boothId, itemId);
-        } else if (delta < 0) {
-          openAllOverviewRemoveBuyerModal(boothId, itemId);
-        }
+        if (delta > 0) openAllOverviewAddBuyerModal(boothId, itemId);
+        else if (delta < 0) openAllOverviewRemoveBuyerModal(boothId, itemId);
       }
     }
 
@@ -2231,11 +2207,7 @@
       const evId = state.activeEventId;
       const item = state.events[evId].booths[boothId].items[itemId];
       const eventRunners = (state.runnersByEvent && state.runnersByEvent[evId]) || [];
-      const orderedMembers = [
-        ...eventRunners,
-        ...state.members.filter(m => !eventRunners.includes(m))
-      ];
-
+      const orderedMembers = [...eventRunners, ...state.members.filter(m => !eventRunners.includes(m))];
       showModal(`
         <div class="flex justify-between items-center mb-3">
           <div>
@@ -2260,7 +2232,6 @@
               }).join('')}
             </div>
           </div>
-
           <div class="pt-3 border-t">
             <label class="text-xs font-bold text-gray-700 block mb-1.5">2. 或即時輸入新成員並選擇：</label>
             <div class="flex gap-2">
@@ -2275,16 +2246,11 @@
     function confirmAllOverviewAddBuyer(boothId, itemId, buyerName) {
       const evId = state.activeEventId;
       const item = state.events[evId].booths[boothId].items[itemId];
-      if (!state.members.includes(buyerName)) {
-        state.members.push(buyerName);
-      }
+      if (!state.members.includes(buyerName)) state.members.push(buyerName);
       if (!state.runnersByEvent[evId]) state.runnersByEvent[evId] = [];
-      if (!state.runnersByEvent[evId].includes(buyerName)) {
-        state.runnersByEvent[evId].push(buyerName);
-      }
+      if (!state.runnersByEvent[evId].includes(buyerName)) state.runnersByEvent[evId].push(buyerName);
       if (!item.purchasedBy) item.purchasedBy = {};
       item.purchasedBy[buyerName] = (item.purchasedBy[buyerName] || 0) + 1;
-
       closeModal();
       updateTotalBoughtQty(boothId, itemId, 1, buyerName);
     }
@@ -2303,14 +2269,10 @@
       const purchasedBy = item.purchasedBy || {};
       const activeBuyers = Object.entries(purchasedBy).filter(([_, cnt]) => cnt > 0);
       const totalBought = Object.values(item.orders || {}).reduce((s, o) => s + (o.bought || 0), 0);
-
       if (activeBuyers.length === 0) {
-        if (totalBought > 0) {
-          updateTotalBoughtQty(boothId, itemId, -1, state.members[0]);
-        }
+        if (totalBought > 0) updateTotalBoughtQty(boothId, itemId, -1, state.members[0]);
         return;
       }
-
       showModal(`
         <div class="flex justify-between items-center mb-3">
           <div>
@@ -2348,10 +2310,7 @@
       if (delta > 0) {
         const totalReq = members.reduce((s, m) => s + ((item.orders[m] && item.orders[m].req) || 0), 0);
         const currentTotalBought = members.reduce((s, m) => s + ((item.orders[m] && item.orders[m].bought) || 0), 0);
-
-        if (currentTotalBought >= totalReq && totalReq > 0) {
-          // 超買
-        } else {
+        if (currentTotalBought < totalReq || totalReq === 0) {
           let targetM = null;
           if (preferredMember && item.orders[preferredMember] && (item.orders[preferredMember].req || 0) > 0 && item.orders[preferredMember].bought < item.orders[preferredMember].req) {
             targetM = preferredMember;
@@ -2418,18 +2377,13 @@
       const currentEv = state.events[state.settleEventId];
       const eventRunners = (state.runnersByEvent && state.runnersByEvent[currentEv.id]) || [];
 
-      let planTotal = 0;
-      let boughtTotal = 0;
-      let pendingTotal = 0;
-      let doneBoothsCount = 0;
-
+      let planTotal = 0, boughtTotal = 0, pendingTotal = 0, doneBoothsCount = 0;
       const runnerSpentMap = {};
       eventRunners.forEach(r => { runnerSpentMap[r] = 0; });
 
       const booths = Object.values(currentEv.booths || {});
       booths.forEach(b => {
         const items = Object.values(b.items || {});
-        
         const isBoothDone = items.length > 0 && items.every(it => {
           const totalReq = state.members.reduce((s, m) => s + ((it.orders && it.orders[m] && it.orders[m].req) || 0), 0);
           const totalBought = state.members.reduce((s, m) => s + ((it.orders && it.orders[m] && it.orders[m].bought) || 0), 0);
@@ -2444,20 +2398,14 @@
 
           if (it.purchasedBy) {
             Object.entries(it.purchasedBy).forEach(([rName, cnt]) => {
-              if (runnerSpentMap[rName] !== undefined) {
-                runnerSpentMap[rName] += cnt * it.price;
-              }
+              if (runnerSpentMap[rName] !== undefined) runnerSpentMap[rName] += cnt * it.price;
             });
           }
 
           state.members.forEach(m => {
             const ord = (it.orders && it.orders[m]) || { req: 0, bought: 0 };
-            const reqCost = ord.req * it.price;
-            const bCost = ord.bought * it.price;
-
-            planTotal += reqCost;
-            boughtTotal += bCost;
-
+            planTotal += ord.req * it.price;
+            boughtTotal += ord.bought * it.price;
             if (it.status === 'pending' && !isDivisionItem) {
               pendingTotal += Math.max(0, (ord.req - ord.bought) * it.price);
             }
@@ -2526,7 +2474,6 @@
           </div>
         </div>
 
-        <!-- 商品瓜分區塊 -->
         <div class="card p-4 mb-4 border-2 border-[#4A7C6F]/20">
           <div class="flex justify-between items-center mb-3">
             <h3 class="font-bold text-base text-gray-800"><i class="fa-solid fa-pie-chart text-[#4A7C6F] mr-1.5"></i>商品瓜分 (買不齊分配)</h3>
@@ -2546,7 +2493,6 @@
               ${pendingDivision.length === 0 ? '<div class="text-center text-xs text-gray-400 py-6">目前沒有買不齊且需要瓜分的商品</div>' : pendingDivision.map(item => {
                 const itObj = state.events[state.settleEventId].booths[item.boothId].items[item.itemId];
                 const validMembersForDivision = state.members.filter(m => ((itObj.orders && itObj.orders[m] && itObj.orders[m].req) || 0) > 0);
-
                 if (!state.divisionEdits[item.itemId]) {
                   state.divisionEdits[item.itemId] = {};
                   validMembersForDivision.forEach(m => {
@@ -2556,7 +2502,6 @@
                 const tempEdits = state.divisionEdits[item.itemId];
                 const currentSumTemp = validMembersForDivision.reduce((s, m) => s + (tempEdits[m] || 0), 0);
                 const isMatch = currentSumTemp === item.totalBought;
-
                 return `
                   <div class="bg-[#F9FAF8] p-3.5 rounded-xl border border-gray-200 space-y-2.5">
                     <div class="flex justify-between items-center">
@@ -2571,7 +2516,6 @@
                         實際買到: ${item.totalBought} / 需求: ${item.totalReq}
                       </div>
                     </div>
-
                     <div class="bg-white p-3 rounded-xl border space-y-2">
                       <div class="text-[11px] font-bold text-gray-600">分配誰獲得這 ${item.totalBought} 件商品：</div>
                       <div class="space-y-1.5">
@@ -2593,9 +2537,7 @@
                         <span class="${isMatch ? 'text-emerald-600 font-bold' : 'text-amber-600 font-bold'}">
                           分配總數: ${currentSumTemp} / ${item.totalBought} ${isMatch ? '✓' : '(需相符)'}
                         </span>
-                        <button onclick="completeDivision('${item.boothId}', '${item.itemId}')" class="btn-primary px-3.5 py-1.5 rounded-xl text-xs font-bold shadow-sm">
-                          完成瓜分
-                        </button>
+                        <button onclick="completeDivision('${item.boothId}', '${item.itemId}')" class="btn-primary px-3.5 py-1.5 rounded-xl text-xs font-bold shadow-sm">完成瓜分</button>
                       </div>
                     </div>
                   </div>
@@ -2623,9 +2565,7 @@
                     </div>
                     <div class="flex items-center gap-2 shrink-0">
                       <span class="text-[11px] px-2 py-1 rounded-lg bg-emerald-100 text-emerald-700 font-bold">已瓜分</span>
-                      <button onclick="editDivision('${item.boothId}', '${item.itemId}')" class="px-3 py-1.5 rounded-lg bg-gray-200 text-gray-700 text-xs font-bold hover:bg-gray-300">
-                        編輯
-                      </button>
+                      <button onclick="editDivision('${item.boothId}', '${item.itemId}')" class="px-3 py-1.5 rounded-lg bg-gray-200 text-gray-700 text-xs font-bold hover:bg-gray-300">編輯</button>
                     </div>
                   </div>
                 `;
@@ -2637,8 +2577,7 @@
         <div class="text-sm font-bold text-gray-700 mb-2 px-1">按人分開算 · 點擊成員查看希望商品、通販待購與 差し入れ 明細</div>
         <div class="space-y-3">
           ${state.members.map(m => {
-            let mBoughtCost = 0;
-            let mPlanCost = 0;
+            let mBoughtCost = 0, mPlanCost = 0;
             booths.forEach(b => {
               Object.values(b.items || {}).forEach(it => {
                 const ord = (it.orders && it.orders[m]) || { req: 0, bought: 0 };
@@ -2646,7 +2585,6 @@
                 mBoughtCost += ord.bought * it.price;
               });
             });
-
             return `
               <div class="card p-4 cursor-pointer hover:bg-gray-50 transition" onclick="openMemberDetailModal('${m}', '${currentEv.id}')">
                 <div class="flex justify-between items-center">
@@ -2671,7 +2609,6 @@
           }).join('')}
         </div>
       `;
-
       container.innerHTML = html;
     }
 
@@ -2709,8 +2646,7 @@
 
       item.divisionCompleted = true;
       delete state.divisionEdits[itemId];
-      saveData();
-      render();
+      saveData(); render();
     }
 
     function editDivision(boothId, itemId) {
@@ -2733,10 +2669,8 @@
       const isEditing = !!state.editingMemberDetails[memberName];
       const eventRunners = (state.runnersByEvent && state.runnersByEvent[evId]) || [];
 
-      const memberItems = [];
-      const pendingOrMissedItems = [];
+      const memberItems = [], pendingOrMissedItems = [], sashiireList = [];
       let totalPlan = 0, totalBought = 0;
-      const sashiireList = [];
       const memberOweRunnerMap = {};
       eventRunners.forEach(r => { memberOweRunnerMap[r] = 0; });
 
@@ -2746,12 +2680,8 @@
           if ((auth.sashiire || []).includes(memberName)) {
             const given = !!(auth.sashiireGiven && auth.sashiireGiven[memberName]);
             sashiireList.push({
-              boothId: b.id,
-              authorIdx: aIdx,
-              authorName: auth.name || '未命名作者',
-              boothCode: b.code,
-              circle: b.circle,
-              given
+              boothId: b.id, authorIdx: aIdx, authorName: auth.name || '未命名作者',
+              boothCode: b.code, circle: b.circle, given
             });
           }
         });
@@ -2765,7 +2695,6 @@
               boothId: b.id, itemId: it.id, boothCode: b.code, circle: b.circle,
               itemName: it.name, price: it.price, req: ord.req, bought: ord.bought, status: it.status, itemImage: it.itemImage
             });
-
             if (it.status !== 'skip' && ord.bought < ord.req) {
               pendingOrMissedItems.push({
                 boothId: b.id, itemId: it.id, boothCode: b.code, circle: b.circle,
@@ -2773,15 +2702,13 @@
                 tsuhanBought: ord.tsuhanBought || 0, status: it.status, itemImage: it.itemImage
               });
             }
-
             if (ord.bought > 0) {
               const pBy = it.purchasedBy || {};
               const totalRunnerBought = Object.values(pBy).reduce((s, c) => s + c, 0);
               if (totalRunnerBought > 0) {
                 Object.entries(pBy).forEach(([rName, rCnt]) => {
                   if (memberOweRunnerMap[rName] !== undefined) {
-                    const proportion = (rCnt / totalRunnerBought) * (ord.bought * it.price);
-                    memberOweRunnerMap[rName] += proportion;
+                    memberOweRunnerMap[rName] += (rCnt / totalRunnerBought) * (ord.bought * it.price);
                   }
                 });
               } else if (eventRunners.length > 0) {
@@ -2802,38 +2729,28 @@
             <p class="text-xs text-gray-400">希望商品、通販待購與 差し入れ 明細</p>
           </div>
           <div class="flex items-center gap-2">
-            <button onclick="toggleMemberDetailEdit('${memberName}')" class="px-2.5 py-1 rounded bg-[#4A7C6F]/15 text-[#4A7C6F] text-xs font-bold">
-              ${isEditing ? '完成編輯' : '編輯'}
-            </button>
+            <button onclick="toggleMemberDetailEdit('${memberName}')" class="px-2.5 py-1 rounded bg-[#4A7C6F]/15 text-[#4A7C6F] text-xs font-bold">${isEditing ? '完成編輯' : '編輯'}</button>
             <button onclick="closeMemberDetailModal()" class="text-gray-400 text-lg">&times;</button>
           </div>
         </div>
-
         <div class="space-y-2 mb-3 bg-gray-50 p-3 rounded-xl text-xs">
           <div class="flex justify-between items-center">
-            <div>
-              預算: <span class="font-bold text-gray-700">${formatCurrency(totalPlan, evId)}</span> | 
-              應付: <span class="font-bold text-[#D96B43]">${formatCurrency(totalBought, evId)}</span>
-            </div>
+            <div>預算: <span class="font-bold text-gray-700">${formatCurrency(totalPlan, evId)}</span> | 應付: <span class="font-bold text-[#D96B43]">${formatCurrency(totalBought, evId)}</span></div>
             <div class="flex gap-1 bg-white p-0.5 rounded border">
               <button onclick="setSettleImageMode('small')" class="px-2 py-0.5 rounded text-[10px] ${state.settleImageMode === 'small' ? 'bg-[#4A7C6F] text-white font-bold' : 'text-gray-600'}">小圖</button>
               <button onclick="setSettleImageMode('medium')" class="px-2 py-0.5 rounded text-[10px] ${state.settleImageMode === 'medium' ? 'bg-[#4A7C6F] text-white font-bold' : 'text-gray-600'}">中圖</button>
               <button onclick="setSettleImageMode('large')" class="px-2 py-0.5 rounded text-[10px] ${state.settleImageMode === 'large' ? 'bg-[#4A7C6F] text-white font-bold' : 'text-gray-600'}">大圖</button>
             </div>
           </div>
-
           <div class="pt-2 border-t border-gray-200">
             <div class="font-bold text-gray-700 mb-1"><i class="fa-solid fa-coins mr-1 text-[#4A7C6F]"></i>需給回各跑攤人的金額：</div>
             <div class="flex flex-wrap gap-2">
               ${eventRunners.length === 0 ? '<span class="text-gray-400">尚無跑攤人資料</span>' : eventRunners.map(r => `
-                <span class="bg-white px-2 py-1 rounded border border-gray-200 font-bold text-gray-800">
-                  ${r}: <span class="text-[#D96B43]">${formatCurrency(Math.round(memberOweRunnerMap[r] || 0), evId)}</span>
-                </span>
+                <span class="bg-white px-2 py-1 rounded border border-gray-200 font-bold text-gray-800">${r}: <span class="text-[#D96B43]">${formatCurrency(Math.round(memberOweRunnerMap[r] || 0), evId)}</span></span>
               `).join('')}
             </div>
           </div>
         </div>
-
         <div class="space-y-4 max-h-[60vh] overflow-y-auto pr-1">
           <details class="bg-indigo-50/70 rounded-xl border border-indigo-200 overflow-hidden" open>
             <summary class="p-3 text-xs font-bold text-indigo-900 cursor-pointer select-none flex justify-between items-center bg-indigo-100/60">
@@ -2860,7 +2777,6 @@
               `).join('')}
             </div>
           </details>
-
           ${sashiireList.length > 0 ? `
             <details class="bg-amber-50/70 rounded-xl border border-amber-200 overflow-hidden" open>
               <summary class="p-3 text-xs font-bold text-amber-900 cursor-pointer select-none flex justify-between items-center bg-amber-100/60">
@@ -2871,23 +2787,18 @@
                 ${sashiireList.map(s => `
                   <div class="flex justify-between items-center px-3 py-2 rounded-lg border transition ${s.given ? 'bg-gray-100 border-gray-200 opacity-50 grayscale' : 'bg-white border-amber-200 shadow-sm'}">
                     <div class="flex items-center gap-2">
-                      ${isEditing ? `
-                        <input type="checkbox" ${s.given ? 'checked' : ''} onchange="toggleMemberDetailSashiire('${evId}', '${s.boothId}', ${s.authorIdx}, '${memberName}', this.checked)" class="w-4 h-4 accent-[#4A7C6F]" />
-                      ` : ''}
+                      ${isEditing ? `<input type="checkbox" ${s.given ? 'checked' : ''} onchange="toggleMemberDetailSashiire('${evId}', '${s.boothId}', ${s.authorIdx}, '${memberName}', this.checked)" class="w-4 h-4 accent-[#4A7C6F]" />` : ''}
                       <div>
                         <span class="font-bold text-xs text-gray-800 ${s.given ? 'line-through' : ''}">${s.authorName}</span>
                         <span class="text-[11px] text-[#4A7C6F] font-bold ml-1.5">(${s.boothCode})</span>
                       </div>
                     </div>
-                    <span class="text-[10px] font-bold px-2 py-0.5 rounded ${s.given ? 'bg-gray-200 text-gray-500' : 'bg-amber-100 text-amber-800'}">
-                      ${s.given ? '已給' : '還沒給'}
-                    </span>
+                    <span class="text-[10px] font-bold px-2 py-0.5 rounded ${s.given ? 'bg-gray-200 text-gray-500' : 'bg-amber-100 text-amber-800'}">${s.given ? '已給' : '還沒給'}</span>
                   </div>
                 `).join('')}
               </div>
             </details>
           ` : ''}
-
           <div class="space-y-2.5">
             ${memberItems.length === 0 ? '<div class="text-center text-xs text-gray-400 py-6">此成員在此活動中無登記任何商品</div>' : memberItems.map(item => {
               const imgClass = state.settleImageMode === 'small' ? 'w-10 h-10' : state.settleImageMode === 'large' ? 'w-24 h-24' : 'w-16 h-16';
@@ -2900,11 +2811,7 @@
                       <div class="text-sm font-medium text-gray-800">${item.itemName}</div>
                       <div class="text-xs text-gray-500 mt-0.5">
                         單價 ${formatCurrency(item.price, evId)} · 
-                        ${isEditing ? `
-                          需求 <input type="number" min="0" value="${item.req}" onchange="updateMemberReqLive('${evId}', '${item.boothId}', '${item.itemId}', '${memberName}', this.value)" class="w-14 border rounded px-1 py-0.5 text-center font-bold text-xs" /> 本
-                        ` : `
-                          需求 <span class="font-bold text-gray-800">${item.req}</span> 本
-                        `}
+                        ${isEditing ? `需求 <input type="number" min="0" value="${item.req}" onchange="updateMemberReqLive('${evId}', '${item.boothId}', '${item.itemId}', '${memberName}', this.value)" class="w-14 border rounded px-1 py-0.5 text-center font-bold text-xs" /> 本` : `需求 <span class="font-bold text-gray-800">${item.req}</span> 本`}
                         / 已買 <span class="font-bold text-[#4A7C6F]">${item.bought}</span> 本
                       </div>
                     </div>
@@ -2926,10 +2833,8 @@
       if (!ev || !ev.booths[boothId] || !ev.booths[boothId].items[itemId]) return;
       const it = ev.booths[boothId].items[itemId];
       if (!it.orders[memberName]) it.orders[memberName] = { req: 0, bought: 0, tsuhanBought: 0 };
-      const cur = it.orders[memberName].tsuhanBought || 0;
-      it.orders[memberName].tsuhanBought = Math.max(0, cur + delta);
-      saveData();
-      openMemberDetailModal(memberName, evId);
+      it.orders[memberName].tsuhanBought = Math.max(0, (it.orders[memberName].tsuhanBought || 0) + delta);
+      saveData(); openMemberDetailModal(memberName, evId);
     }
 
     function toggleMemberDetailSashiire(evId, boothId, authorIdx, memberName, isChecked) {
@@ -2940,8 +2845,7 @@
         if (!authors[authorIdx].sashiireGiven) authors[authorIdx].sashiireGiven = {};
         authors[authorIdx].sashiireGiven[memberName] = isChecked;
         ev.booths[boothId].authors = authors;
-        saveData();
-        openMemberDetailModal(memberName, evId);
+        saveData(); openMemberDetailModal(memberName, evId);
       }
     }
 
@@ -2974,7 +2878,6 @@
       const subTab = state.librarySubTab || 'items';
       const filterEv = state.libraryFilterEvent || 'all';
       const filterTag = state.libraryFilterTag || 'all';
-
       const evList = getSortedEvents();
       const allTags = getTopTags();
 
@@ -2987,13 +2890,11 @@
             </div>
             <button onclick="openNewFavModal()" class="btn-primary px-3 py-1.5 rounded-xl text-xs font-bold shrink-0">+ 收藏作者</button>
           </div>
-
           <div class="flex bg-gray-100 p-1 rounded-xl text-xs mb-3">
             <button onclick="setLibrarySubTab('items')" class="flex-1 py-1.5 rounded-lg font-bold transition ${subTab === 'items' ? 'bg-[#4A7C6F] text-white shadow-sm' : 'text-gray-600'}">商品庫</button>
             <button onclick="setLibrarySubTab('authors')" class="flex-1 py-1.5 rounded-lg font-bold transition ${subTab === 'authors' ? 'bg-[#4A7C6F] text-white shadow-sm' : 'text-gray-600'}">作者庫</button>
             <button onclick="setLibrarySubTab('members')" class="flex-1 py-1.5 rounded-lg font-bold transition ${subTab === 'members' ? 'bg-[#4A7C6F] text-white shadow-sm' : 'text-gray-600'}">成員庫</button>
           </div>
-
           <div class="space-y-2">
             <div class="relative">
               <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-gray-400 text-xs"></i>
@@ -3017,19 +2918,16 @@
         </div>
         <div id="library-results-container"></div>
       `;
-
       renderLibraryResultsOnly();
     }
 
     function renderLibraryResultsOnly() {
       const resultsEl = document.getElementById('library-results-container');
       if (!resultsEl) return;
-
       const subTab = state.librarySubTab || 'items';
       const search = (state.librarySearch || '').trim().toLowerCase();
       const filterEv = state.libraryFilterEvent || 'all';
       const filterTag = state.libraryFilterTag || 'all';
-
       let html = '';
 
       if (subTab === 'items') {
@@ -3040,26 +2938,17 @@
             Object.values(b.items || {}).forEach(it => {
               const tags = Array.isArray(it.tags) ? it.tags : [];
               if (filterTag !== 'all' && !tags.includes(filterTag)) return;
-
               const itemName = (it.name || '').toLowerCase();
               const authorsStr = getItemAuthors(it).join(' ').toLowerCase();
               if (search && !itemName.includes(search) && !authorsStr.includes(search)) return;
-
               const memberGetSummary = [];
               state.members.forEach(m => {
                 const bgt = (it.orders && it.orders[m] && it.orders[m].bought) || 0;
                 if (bgt > 0) memberGetSummary.push(`${m}×${bgt}`);
               });
-
               allItemsList.push({
-                evId: ev.id,
-                evName: ev.name,
-                boothId: b.id,
-                boothCode: b.code,
-                circle: b.circle,
-                item: it,
-                authors: getItemAuthors(it),
-                memberGetSummary
+                evId: ev.id, evName: ev.name, boothId: b.id, boothCode: b.code, circle: b.circle,
+                item: it, authors: getItemAuthors(it), memberGetSummary
               });
             });
           });
@@ -3082,9 +2971,7 @@
                       <div class="text-xs text-[#D96B43] font-bold mt-0.5">${formatCurrency(it.price, entry.evId)}</div>
                     </div>
                   </div>
-                  <button onclick="openAddToEventModal('item', '${entry.evId}', '${entry.boothId}', '${it.id}')" class="btn-primary px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 shadow-sm">
-                    + 加入活動
-                  </button>
+                  <button onclick="openAddToEventModal('item', '${entry.evId}', '${entry.boothId}', '${it.id}')" class="btn-primary px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 shadow-sm">+ 加入活動</button>
                 </div>
                 <div class="flex justify-between items-center text-[11px] text-gray-500 pt-1 border-t border-gray-100">
                   <span>創作者: ${entry.authors.join('、') || '無'}</span>
@@ -3095,7 +2982,6 @@
           });
         }
         html += `</div>`;
-
       } else if (subTab === 'authors') {
         let authorMap = {};
         Object.values(state.events || {}).forEach(ev => {
@@ -3104,10 +2990,7 @@
             getBoothAuthors(b).forEach(a => {
               if (!a.name) return;
               if (search && !a.name.toLowerCase().includes(search) && !(b.circle || '').toLowerCase().includes(search)) return;
-
-              if (!authorMap[a.name]) {
-                authorMap[a.name] = { name: a.name, links: a.links || [], events: new Set(), items: [] };
-              }
+              if (!authorMap[a.name]) authorMap[a.name] = { name: a.name, links: a.links || [], events: new Set(), items: [] };
               authorMap[a.name].events.add(ev.name);
               Object.values(b.items || {}).forEach(it => {
                 const itsAuth = getItemAuthors(it);
@@ -3118,17 +3001,12 @@
             });
           });
         });
-
         (state.favorites || []).forEach(f => {
           if (!f.author) return;
           if (search && !f.author.toLowerCase().includes(search) && !(f.circle || '').toLowerCase().includes(search)) return;
-          if (!authorMap[f.author]) {
-            authorMap[f.author] = { name: f.author, links: f.link ? [f.link] : [], events: new Set(['常用收藏']), items: [] };
-          }
+          if (!authorMap[f.author]) authorMap[f.author] = { name: f.author, links: f.link ? [f.link] : [], events: new Set(['常用收藏']), items: [] };
         });
-
         const authorsList = Object.values(authorMap);
-
         html += `<div class="space-y-3">`;
         if (authorsList.length === 0) {
           html += `<div class="card p-8 text-center text-gray-400 text-xs">沒有找到符合條件的作者</div>`;
@@ -3142,9 +3020,7 @@
                     <div class="font-bold text-base text-gray-800">${auth.name}</div>
                     <div class="text-xs text-gray-400 mt-0.5">出現活動：${evsArr.join('、')}</div>
                   </div>
-                  <button onclick="openAddToEventModal('author', '', '', '', '${auth.name.replace(/'/g, "\'")}')" class="btn-primary px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 shadow-sm">
-                    + 加入活動
-                  </button>
+                  <button onclick="openAddToEventModal('author', '', '', '', '${auth.name.replace(/'/g, "\'")}')" class="btn-primary px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 shadow-sm">+ 加入活動</button>
                 </div>
                 ${auth.items.length > 0 ? `
                   <div class="bg-gray-50 p-2.5 rounded-xl border space-y-1">
@@ -3165,10 +3041,8 @@
           });
         }
         html += `</div>`;
-
       } else if (subTab === 'members') {
         const filteredMembers = state.members.filter(m => !search || m.toLowerCase().includes(search));
-
         html += `<div class="space-y-3">`;
         if (filteredMembers.length === 0) {
           html += `<div class="card p-8 text-center text-gray-400 text-xs">沒有找到符合條件的成員</div>`;
@@ -3190,7 +3064,6 @@
         }
         html += `</div>`;
       }
-
       resultsEl.innerHTML = html;
     }
 
@@ -3202,7 +3075,6 @@
     function openAddToEventModal(type, srcEvId, srcBoothId, srcItemId, authorName = '') {
       const evList = getSortedEvents();
       if (evList.length === 0) return alert('請先建立展會活動！');
-
       let targetEvId = state.activeEventId || evList[0].id;
       let targetBoothAction = 'existing';
       let selectedBoothId = '';
@@ -3224,7 +3096,6 @@
       window.renderAddToEventModalContent = () => {
         const ev = state.events[targetEvId];
         const booths = ev && ev.booths ? Object.values(ev.booths) : [];
-
         showModal(`
           <div class="flex justify-between items-center mb-3">
             <h3 class="font-bold text-base text-gray-800"><i class="fa-solid fa-circle-plus text-[#4A7C6F] mr-1.5"></i>將${type === 'item' ? '商品' : '作者'}加入活動</h3>
@@ -3237,14 +3108,12 @@
                 ${evList.map(e => `<option value="${e.id}" ${e.id === targetEvId ? 'selected' : ''}>${e.name} (${e.hall || '主展館'})</option>`).join('')}
               </select>
             </div>
-
             <div>
               <label class="text-xs font-bold text-gray-700 block mb-1">2. 選擇加入現有攤位或新增攤位：</label>
               <div class="flex gap-2 mb-2">
                 <button type="button" onclick="setBoothAction('existing')" class="flex-1 py-1.5 rounded-lg text-xs font-bold border ${targetBoothAction === 'existing' ? 'bg-[#4A7C6F] text-white border-[#4A7C6F]' : 'bg-white text-gray-700'}">選擇現有攤位</button>
                 <button type="button" onclick="setBoothAction('new')" class="flex-1 py-1.5 rounded-lg text-xs font-bold border ${targetBoothAction === 'new' ? 'bg-[#4A7C6F] text-white border-[#4A7C6F]' : 'bg-white text-gray-700'}">新增新攤位</button>
               </div>
-
               ${targetBoothAction === 'existing' ? `
                 <div class="space-y-1.5">
                   <input id="booth-quick-search" type="text" placeholder="搜尋攤位編號或社團名稱加速選擇..." oninput="filterBoothListInModal(this.value)" class="w-full border rounded-xl px-3 py-2 text-xs" />
@@ -3272,7 +3141,6 @@
                 </div>
               `}
             </div>
-
             ${type === 'author' ? `
               <div class="bg-amber-50/70 p-3 rounded-xl border border-amber-200 space-y-2">
                 <label class="text-xs font-bold text-amber-900 block">3. 勾選該作者的過往商品一併加入：</label>
@@ -3287,10 +3155,7 @@
                 </div>
               </div>
             ` : ''}
-
-            <button type="button" onclick="confirmAddToEvent('${type}', '${srcEvId}', '${srcBoothId}', '${srcItemId}', '${authorName.replace(/'/g, "\'")}')" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold shadow-sm mt-2">
-              確認加入活動
-            </button>
+            <button type="button" onclick="confirmAddToEvent('${type}', '${srcEvId}', '${srcBoothId}', '${srcItemId}', '${authorName.replace(/'/g, "\'")}')" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold shadow-sm mt-2">確認加入活動</button>
           </div>
         `);
       };
@@ -3301,44 +3166,37 @@
         const query = val.toLowerCase();
         document.querySelectorAll('.booth-option-label').forEach(lbl => {
           const txt = lbl.dataset.text || '';
-          if (txt.includes(query)) lbl.style.display = 'flex';
-          else lbl.style.display = 'none';
+          lbl.style.display = txt.includes(query) ? 'flex' : 'none';
         });
       };
 
       window.confirmAddToEvent = (t, sEvId, sBoothId, sItemId, aName) => {
         const targetEv = state.events[targetEvId];
         if (!targetEv) return alert('請選擇有效的目標活動');
-
         let destBoothId = selectedBoothId;
         if (targetBoothAction === 'new') {
           const bCode = document.getElementById('new-added-booth-code').value.trim();
           const bCircle = document.getElementById('new-added-booth-circle').value.trim();
           if (!bCode || !bCircle) return alert('請填寫新攤位編號與社團名稱');
-          
           destBoothId = 'b_' + Date.now();
           if (!targetEv.booths) targetEv.booths = {};
           const order = Object.keys(targetEv.booths).length + 1;
-
           let boothAuthors = [{ name: t === 'author' ? aName : '作者', links: [], sashiire: [], sashiireGiven: {} }];
           if (t === 'item') {
             const srcIt = state.events[sEvId]?.booths[sBoothId]?.items[sItemId];
             const srcAuths = srcIt ? getItemAuthors(srcIt) : [];
             if (srcAuths.length > 0) boothAuthors = srcAuths.map(an => ({ name: an, links: [], sashiire: [], sashiireGiven: {} }));
           }
-
           targetEv.booths[destBoothId] = {
             id: destBoothId, code: bCode, circle: bCircle,
             authors: boothAuthors, boothMapImage: '', flyerImages: [],
             order, x: 50, y: 50, items: {}
           };
         }
-
         if (!destBoothId && targetBoothAction === 'existing') {
           const firstRadio = document.querySelector('input[name="target_booth_radio"]:checked') || document.querySelector('input[name="target_booth_radio"]');
           if (firstRadio) destBoothId = firstRadio.value;
         }
-
         if (!targetEv.booths[destBoothId]) return alert('請選擇或建立目標攤位！');
         const destBooth = targetEv.booths[destBoothId];
         if (!destBooth.items) destBooth.items = {};
@@ -3349,20 +3207,11 @@
           const newId = 'item_' + Date.now();
           const orders = {};
           state.members.forEach(m => { orders[m] = { req: 0, bought: 0 }; });
-
           destBooth.items[newId] = {
-            id: newId,
-            name: srcIt.name,
-            price: srcIt.price,
-            reserve: srcIt.reserve || 0,
-            links: [...getItemLinks(srcIt)],
-            tags: [...(srcIt.tags || [])],
-            authors: [...getItemAuthors(srcIt)],
-            status: 'pending',
-            itemImage: srcIt.itemImage || '',
-            divisionCompleted: false,
-            order: Object.keys(destBooth.items).length + 1,
-            orders
+            id: newId, name: srcIt.name, price: srcIt.price, reserve: srcIt.reserve || 0,
+            links: [...getItemLinks(srcIt)], tags: [...(srcIt.tags || [])], authors: [...getItemAuthors(srcIt)],
+            status: 'pending', itemImage: srcIt.itemImage || '', divisionCompleted: false,
+            order: Object.keys(destBooth.items).length + 1, orders
           };
           alert(`成功將「${srcIt.name}」加入「${targetEv.name}」的攤位 ${destBooth.code}！`);
         } else if (t === 'author') {
@@ -3371,7 +3220,6 @@
             boothAuths.push({ name: aName, links: [], sashiire: [], sashiireGiven: {} });
             destBooth.authors = boothAuths;
           }
-
           const chks = document.querySelectorAll('.author-past-work-chk:checked');
           chks.forEach(chk => {
             const p = pastWorksForAuthor[parseInt(chk.dataset.idx)];
@@ -3379,30 +3227,17 @@
             const newId = 'item_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
             const orders = {};
             state.members.forEach(m => { orders[m] = { req: 0, bought: 0 }; });
-
             destBooth.items[newId] = {
-              id: newId,
-              name: p.name,
-              price: p.price,
-              reserve: 0,
-              links: [...p.links],
-              tags: [...p.tags],
-              authors: [aName],
-              status: 'pending',
-              itemImage: p.itemImage,
-              divisionCompleted: false,
-              order: Object.keys(destBooth.items).length + 1,
-              orders
+              id: newId, name: p.name, price: p.price, reserve: 0,
+              links: [...p.links], tags: [...p.tags], authors: [aName],
+              status: 'pending', itemImage: p.itemImage, divisionCompleted: false,
+              order: Object.keys(destBooth.items).length + 1, orders
             };
           });
           alert(`成功將作者「${aName}」與 ${chks.length} 件商品加入「${targetEv.name}」！`);
         }
-
-        closeModal();
-        saveData();
-        render();
+        closeModal(); saveData(); render();
       };
-
       window.renderAddToEventModalContent();
     }
 
@@ -3413,21 +3248,10 @@
       window.renderLibMemberModal = () => {
         const ev = state.events[activeEvId];
         if (!ev) return;
-
         let totalPlan = 0, totalBought = 0;
-        const memberItems = [];
-        const pendingOrMissedItems = [];
-        const sashiireList = [];
+        const memberItems = [], pendingOrMissedItems = [];
 
         Object.values(ev.booths || {}).forEach(b => {
-          const authors = getBoothAuthors(b);
-          authors.forEach((auth, aIdx) => {
-            if ((auth.sashiire || []).includes(memberName)) {
-              const given = !!(auth.sashiireGiven && auth.sashiireGiven[memberName]);
-              sashiireList.push({ boothId: b.id, authorIdx: aIdx, authorName: auth.name || '未命名', boothCode: b.code, circle: b.circle, given });
-            }
-          });
-
           Object.values(b.items || {}).forEach(it => {
             const ord = it.orders && it.orders[memberName];
             if (ord && (ord.req > 0 || ord.bought > 0)) {
@@ -3458,15 +3282,11 @@
             </div>
             <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
           </div>
-
           <div class="flex gap-2 overflow-x-auto no-scrollbar py-1 mb-3">
             ${evList.map(e => `
-              <button onclick="switchLibMemberEv('${e.id}', '${memberName}')" class="px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap ${e.id === activeEvId ? 'bg-[#4A7C6F] text-white' : 'bg-gray-100 text-gray-600'}">
-                ${e.name}
-              </button>
+              <button onclick="switchLibMemberEv('${e.id}', '${memberName}')" class="px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap ${e.id === activeEvId ? 'bg-[#4A7C6F] text-white' : 'bg-gray-100 text-gray-600'}">${e.name}</button>
             `).join('')}
           </div>
-
           <div class="flex justify-between items-center mb-3 bg-gray-50 p-3 rounded-xl text-xs">
             <div>預算: <span class="font-bold text-gray-700">${formatCurrency(totalPlan, activeEvId)}</span> | 應付: <span class="font-bold text-[#D96B43]">${formatCurrency(totalBought, activeEvId)}</span></div>
             <div class="flex gap-1 bg-white p-0.5 rounded border shrink-0">
@@ -3475,7 +3295,6 @@
               <button onclick="setLibMemberImageMode('large')" class="px-2 py-0.5 rounded text-[10px] ${state.libMemberImageMode === 'large' ? 'bg-[#4A7C6F] text-white font-bold' : 'text-gray-600'}">大圖</button>
             </div>
           </div>
-
           <div class="space-y-4 max-h-[55vh] overflow-y-auto pr-1">
             <details class="bg-indigo-50/70 rounded-xl border border-indigo-200 overflow-hidden" open>
               <summary class="p-3 text-xs font-bold text-indigo-900 cursor-pointer select-none flex justify-between items-center bg-indigo-100/60">
@@ -3507,7 +3326,6 @@
                 `).join('')}
               </div>
             </details>
-
             <div class="space-y-2.5">
               ${memberItems.length === 0 ? '<div class="text-center text-xs text-gray-400 py-6">此成員在此活動中無登記商品</div>' : memberItems.map(item => `
                 <div class="bg-[#F9FAF8] p-3 rounded-xl border flex items-center justify-between text-xs gap-2">
@@ -3527,23 +3345,16 @@
         `);
       };
 
-      window.setLibMemberImageMode = (mode) => {
-        state.libMemberImageMode = mode;
-        saveData();
-        window.renderLibMemberModal();
-      };
+      window.setLibMemberImageMode = (mode) => { state.libMemberImageMode = mode; saveData(); window.renderLibMemberModal(); };
       window.switchLibMemberEv = (evId, mName) => { activeEvId = evId; window.renderLibMemberModal(); };
       window.updateLibTsuhanQty = (evId, boothId, itemId, mName, delta) => {
         const ev = state.events[evId];
         if (!ev || !ev.booths[boothId] || !ev.booths[boothId].items[itemId]) return;
         const it = ev.booths[boothId].items[itemId];
         if (!it.orders[mName]) it.orders[mName] = { req: 0, bought: 0, tsuhanBought: 0 };
-        const cur = it.orders[mName].tsuhanBought || 0;
-        it.orders[mName].tsuhanBought = Math.max(0, cur + delta);
-        saveData();
-        window.renderLibMemberModal();
+        it.orders[mName].tsuhanBought = Math.max(0, (it.orders[mName].tsuhanBought || 0) + delta);
+        saveData(); window.renderLibMemberModal();
       };
-
       window.renderLibMemberModal();
     }
 
@@ -3593,23 +3404,18 @@
       const authors = getBoothAuthors(booth);
       if (!authors[authorIdx]) return;
       if (!Array.isArray(authors[authorIdx].sashiire)) authors[authorIdx].sashiire = [];
-      
       const idx = authors[authorIdx].sashiire.indexOf(memberName);
       if (idx === -1) authors[authorIdx].sashiire.push(memberName);
       else authors[authorIdx].sashiire.splice(idx, 1);
-
       booth.authors = authors;
-      saveData();
-      render();
+      saveData(); render();
     }
 
     function quickAddMemberForSashiire(boothId, authorIdx) {
       const name = prompt('請輸入要新增的成員名字：');
       if (!name || !name.trim()) return;
       const clean = name.trim();
-      if (!state.members.includes(clean)) {
-        state.members.push(clean);
-      }
+      if (!state.members.includes(clean)) state.members.push(clean);
       toggleEditSashiireMember(boothId, authorIdx, clean);
     }
 
@@ -3620,18 +3426,12 @@
       if (idx === -1) return;
       const targetIdx = idx + direction;
       if (targetIdx < 0 || targetIdx >= items.length) return;
-
       const moved = items.splice(idx, 1)[0];
       items.splice(targetIdx, 0, moved);
       items.forEach((it, i) => { booth.items[it.id].order = i + 1; });
-
-      saveData();
-      render();
+      saveData(); render();
     }
 
-    // ------------------------------------------
-    // 召喚商品功能（支援「編輯攤位」與「新增攤位」按鈕觸發）
-    // ------------------------------------------
     function triggerSummonForEditingBooth(boothId) {
       const nameInputs = document.querySelectorAll(`.edit-author-block-${boothId} .edit-author-name`);
       const authorNames = Array.from(nameInputs).map(i => i.value.trim()).filter(Boolean);
@@ -3649,7 +3449,6 @@
         alert('請先填寫至少一位作者名稱，才能召喚該作者的過往商品！');
         return;
       }
-      // 先自動建立新攤位並直接帶入召喚商品視窗
       const code = document.getElementById('new-b-code').value.trim() || '未編號';
       const circle = document.getElementById('new-b-circle').value.trim() || '未命名社團';
       const authorBlocks = document.querySelectorAll('.new-author-block');
@@ -3682,7 +3481,6 @@
       };
       tempNewBoothMapData = '';
       saveData();
-
       openSummonWorksModalForBooth(newBoothId, authorNames, true);
     }
 
@@ -3690,22 +3488,15 @@
       const pastItems = [];
       Object.values(state.events || {}).forEach(ev => {
         Object.values(ev.booths || {}).forEach(b => {
-          // 排除自己目前這個攤位
           if (b.id === boothId) return;
           const bAuthors = getBoothAuthors(b).map(a => a.name).filter(Boolean);
           Object.values(b.items || {}).forEach(it => {
             const itAuthors = getItemAuthors(it);
             const combinedAuthors = [...new Set([...bAuthors, ...itAuthors])];
             pastItems.push({
-              eventName: ev.name,
-              boothCode: b.code,
-              circle: b.circle,
-              authors: combinedAuthors,
-              name: it.name,
-              price: it.price,
-              links: getItemLinks(it),
-              tags: it.tags || [],
-              itemImage: it.itemImage || ''
+              eventName: ev.name, boothCode: b.code, circle: b.circle,
+              authors: combinedAuthors, name: it.name, price: it.price,
+              links: getItemLinks(it), tags: it.tags || [], itemImage: it.itemImage || ''
             });
           });
         });
@@ -3723,7 +3514,6 @@
           </div>
           <button onclick="closeModal(); render();" class="text-gray-400 text-lg">&times;</button>
         </div>
-
         <div class="space-y-2 max-h-[55vh] overflow-y-auto pr-1 mb-4">
           ${filtered.length === 0 ? `<div class="text-center text-xs text-gray-400 py-8">在歷史資料庫中找不到「${authorNames.join('、')}」的過往商品紀錄</div>` : filtered.map((p, idx) => `
             <label class="flex items-center gap-2.5 bg-gray-50 p-2.5 rounded-xl border border-gray-200 cursor-pointer hover:bg-emerald-50/40">
@@ -3736,24 +3526,15 @@
             </label>
           `).join('')}
         </div>
-
-        <button type="button" id="btn-confirm-summon" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold shadow-sm">
-          確認召喚並加入攤位
-        </button>
+        <button type="button" id="btn-confirm-summon" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold shadow-sm">確認召喚並加入攤位</button>
       `);
 
       document.getElementById('btn-confirm-summon').onclick = () => {
         const checkedBoxes = document.querySelectorAll('.summon-work-checkbox:checked');
-        if (checkedBoxes.length === 0) {
-          closeModal();
-          render();
-          return;
-        }
-
+        if (checkedBoxes.length === 0) { closeModal(); render(); return; }
         const ev = state.events[state.activeEventId];
         if (!ev || !ev.booths[boothId]) { closeModal(); return; }
         if (!ev.booths[boothId].items) ev.booths[boothId].items = {};
-
         let orderCounter = Object.keys(ev.booths[boothId].items).length + 1;
         checkedBoxes.forEach(cb => {
           const p = filtered[parseInt(cb.dataset.idx)];
@@ -3761,28 +3542,16 @@
           const newId = 'item_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
           const orders = {};
           state.members.forEach(m => { orders[m] = { req: 0, bought: 0 }; });
-
           const matchedItemAuthors = p.authors.filter(pa => authorNames.some(an => pa.includes(an) || an.includes(pa)));
-
           ev.booths[boothId].items[newId] = {
-            id: newId,
-            name: p.name,
-            price: p.price,
-            reserve: 0,
-            links: [...p.links],
-            tags: [...p.tags],
+            id: newId, name: p.name, price: p.price, reserve: 0,
+            links: [...p.links], tags: [...p.tags],
             authors: matchedItemAuthors.length > 0 ? matchedItemAuthors : [...authorNames],
-            order: orderCounter++,
-            status: 'pending',
-            itemImage: p.itemImage,
-            divisionCompleted: false,
-            orders
+            order: orderCounter++, status: 'pending', itemImage: p.itemImage,
+            divisionCompleted: false, orders
           };
         });
-
-        closeModal();
-        saveData();
-        render();
+        closeModal(); saveData(); render();
       };
     }
 
@@ -3826,26 +3595,18 @@
     function finishBoothEdit(boothId) {
       const codeInput = document.getElementById(`edit-b-code-${boothId}`);
       const circleInput = document.getElementById(`edit-b-circle-${boothId}`);
-      
       if (codeInput && circleInput) {
         const code = codeInput.value.trim();
         const circle = circleInput.value.trim();
         if (!code || !circle) return alert('請填寫攤位編號與社團名稱');
-
         const booth = state.events[state.activeEventId].booths[boothId];
         const prevAuthors = getBoothAuthors(booth);
-
         const authorBlocks = document.querySelectorAll(`.edit-author-block-${boothId}`);
         const updatedAuthors = Array.from(authorBlocks).map((blk, idx) => {
           const name = blk.querySelector('.edit-author-name').value.trim();
           const links = Array.from(blk.querySelectorAll('.edit-author-link')).map(i => i.value.trim()).filter(Boolean);
           const prev = prevAuthors[idx] || { sashiire: [], sashiireGiven: {} };
-          return {
-            name,
-            links,
-            sashiire: prev.sashiire || [],
-            sashiireGiven: prev.sashiireGiven || {}
-          };
+          return { name, links, sashiire: prev.sashiire || [], sashiireGiven: prev.sashiireGiven || {} };
         }).filter(a => a.name);
 
         const flyers = getBoothFlyers(booth);
@@ -3859,133 +3620,119 @@
         booth.authors = updatedAuthors;
         booth.flyerImages = flyers;
       }
-
       state.editingBooths[boothId] = false;
-      saveData();
-      render();
+      saveData(); render();
     }
 
     function deleteBooth(boothId) {
       if (!confirm('確定要刪除此攤位及攤位內的所有商品嗎？此操作無法復原！')) return;
       delete state.events[state.activeEventId].booths[boothId];
       state.editingBooths[boothId] = false;
-      saveData();
-      render();
+      saveData(); render();
+    }
+
+    // ------------------------------------------
+    // 圖片上傳與剪貼板貼上（全部強制壓縮，防止大容量超載與同步失敗）
+    // ------------------------------------------
+    async function extractCompressedImageFromClipboard(maxWidth = 760, quality = 0.72) {
+      const clipboardItems = await navigator.clipboard.read();
+      for (const clipboardItem of clipboardItems) {
+        for (const type of clipboardItem.types) {
+          if (type.startsWith('image/')) {
+            const blob = await clipboardItem.getType(type);
+            return await readBlobOrFileAsCompressedDataUrl(blob, maxWidth, quality);
+          }
+        }
+      }
+      return null;
     }
 
     async function handleBoothMapUpload(e, boothId) {
       const file = e.target.files[0];
       if (!file) return;
-      const compressed = await readFileAsCompressedDataUrl(file, 800, 0.75);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 760, 0.72);
       state.events[state.activeEventId].booths[boothId].boothMapImage = compressed;
-      saveData();
+      await saveData();
       render();
     }
 
     async function pasteBoothMap(boothId) {
       try {
-        const clipboardItems = await navigator.clipboard.read();
-        for (const clipboardItem of clipboardItems) {
-          for (const type of clipboardItem.types) {
-            if (type.startsWith('image/')) {
-              const blob = await clipboardItem.getType(type);
-              const reader = new FileReader();
-              reader.onload = function(evt) {
-                state.events[state.activeEventId].booths[boothId].boothMapImage = evt.target.result;
-                saveData();
-                render();
-              };
-              reader.readAsDataURL(blob);
-              return;
-            }
-          }
+        const compressed = await extractCompressedImageFromClipboard(760, 0.72);
+        if (!compressed) {
+          alert('剪貼板中沒有找到圖片');
+          return;
         }
-        alert('剪貼板中沒有找到圖片');
-      } catch (err) { alert('無法讀取剪貼板'); }
+        state.events[state.activeEventId].booths[boothId].boothMapImage = compressed;
+        await saveData();
+        render();
+      } catch (err) {
+        alert('無法讀取剪貼板圖片，請確認瀏覽器已允許剪貼板權限，或改用「選擇圖片」上傳。');
+      }
     }
 
-    function handleBoothFlyerUpload(e, boothId) {
+    async function handleBoothFlyerUpload(e, boothId) {
       const files = Array.from(e.target.files);
       if (!files.length) return;
       const booth = state.events[state.activeEventId].booths[boothId];
       if (!Array.isArray(booth.flyerImages)) {
         booth.flyerImages = booth.flyerImage ? [{ url: booth.flyerImage, link: '' }] : [];
       }
-      files.forEach(file => {
-        const reader = new FileReader();
-        reader.onload = function(evt) {
-          booth.flyerImages.push({ url: evt.target.result, link: '' });
-          saveData();
-          render();
-        };
-        reader.readAsDataURL(file);
-      });
+      for (const file of files) {
+        const compressed = await readBlobOrFileAsCompressedDataUrl(file, 960, 0.74);
+        booth.flyerImages.push({ url: compressed, link: '' });
+      }
+      await saveData();
+      render();
     }
 
-    function handleSingleBoothFlyerUpload(e, boothId, flyerIdx) {
+    async function handleSingleBoothFlyerUpload(e, boothId, flyerIdx) {
       const file = e.target.files[0];
       if (!file) return;
-      const reader = new FileReader();
-      reader.onload = function(evt) {
-        const booth = state.events[state.activeEventId].booths[boothId];
-        const flyers = getBoothFlyers(booth);
-        if (flyers[flyerIdx]) flyers[flyerIdx].url = evt.target.result;
-        booth.flyerImages = flyers;
-        saveData();
-        render();
-      };
-      reader.readAsDataURL(file);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 960, 0.74);
+      const booth = state.events[state.activeEventId].booths[boothId];
+      const flyers = getBoothFlyers(booth);
+      if (flyers[flyerIdx]) flyers[flyerIdx].url = compressed;
+      booth.flyerImages = flyers;
+      await saveData();
+      render();
     }
 
     async function pasteBoothFlyer(boothId) {
       try {
-        const clipboardItems = await navigator.clipboard.read();
-        for (const clipboardItem of clipboardItems) {
-          for (const type of clipboardItem.types) {
-            if (type.startsWith('image/')) {
-              const blob = await clipboardItem.getType(type);
-              const reader = new FileReader();
-              reader.onload = function(evt) {
-                const booth = state.events[state.activeEventId].booths[boothId];
-                if (!Array.isArray(booth.flyerImages)) {
-                  booth.flyerImages = booth.flyerImage ? [{ url: booth.flyerImage, link: '' }] : [];
-                }
-                booth.flyerImages.push({ url: evt.target.result, link: '' });
-                saveData();
-                render();
-              };
-              reader.readAsDataURL(blob);
-              return;
-            }
-          }
+        const compressed = await extractCompressedImageFromClipboard(960, 0.74);
+        if (!compressed) {
+          alert('剪貼板中沒有找到圖片');
+          return;
         }
-        alert('剪貼板中沒有找到圖片');
-      } catch (err) { alert('無法讀取剪貼板'); }
+        const booth = state.events[state.activeEventId].booths[boothId];
+        if (!Array.isArray(booth.flyerImages)) {
+          booth.flyerImages = booth.flyerImage ? [{ url: booth.flyerImage, link: '' }] : [];
+        }
+        booth.flyerImages.push({ url: compressed, link: '' });
+        await saveData();
+        render();
+      } catch (err) {
+        alert('無法讀取剪貼板');
+      }
     }
 
     async function pasteSingleBoothFlyer(boothId, flyerIdx) {
       try {
-        const clipboardItems = await navigator.clipboard.read();
-        for (const clipboardItem of clipboardItems) {
-          for (const type of clipboardItem.types) {
-            if (type.startsWith('image/')) {
-              const blob = await clipboardItem.getType(type);
-              const reader = new FileReader();
-              reader.onload = function(evt) {
-                const booth = state.events[state.activeEventId].booths[boothId];
-                const flyers = getBoothFlyers(booth);
-                if (flyers[flyerIdx]) flyers[flyerIdx].url = evt.target.result;
-                booth.flyerImages = flyers;
-                saveData();
-                render();
-              };
-              reader.readAsDataURL(blob);
-              return;
-            }
-          }
+        const compressed = await extractCompressedImageFromClipboard(960, 0.74);
+        if (!compressed) {
+          alert('剪貼板中沒有找到圖片');
+          return;
         }
-        alert('剪貼板中沒有找到圖片');
-      } catch (err) { alert('無法讀取剪貼板'); }
+        const booth = state.events[state.activeEventId].booths[boothId];
+        const flyers = getBoothFlyers(booth);
+        if (flyers[flyerIdx]) flyers[flyerIdx].url = compressed;
+        booth.flyerImages = flyers;
+        await saveData();
+        render();
+      } catch (err) {
+        alert('無法讀取剪貼板');
+      }
     }
 
     function removeBoothFlyer(boothId, flyerIdx) {
@@ -3993,8 +3740,7 @@
       const flyers = getBoothFlyers(booth);
       flyers.splice(flyerIdx, 1);
       booth.flyerImages = flyers;
-      saveData();
-      render();
+      saveData(); render();
     }
 
     function toggleItemEdit(itemId) { state.editingItems[itemId] = !state.editingItems[itemId]; render(); }
@@ -4004,17 +3750,14 @@
       const priceInput = document.getElementById(`edit-it-price-${itemId}`);
       const reserveInput = document.getElementById(`edit-it-reserve-${itemId}`);
       const tagsInput = document.getElementById(`edit-it-tags-${itemId}`);
-
       if (nameInput && priceInput) {
         const name = nameInput.value.trim();
         const price = parseFloat(priceInput.value) || 0;
         const reserve = parseInt(reserveInput ? reserveInput.value : 0) || 0;
         if (!name) return alert('請輸入商品名稱');
-
         const linkInputs = document.querySelectorAll(`.item-link-input-${itemId}`);
         const links = Array.from(linkInputs).map(inp => inp.value.trim()).filter(Boolean);
         const tags = tagsInput ? tagsInput.value.split(',').map(s => s.trim()).filter(Boolean) : [];
-
         const authorCheckboxes = document.querySelectorAll(`.edit-item-author-chk-${itemId}:checked`);
         const chosenAuthors = Array.from(authorCheckboxes).map(c => c.value);
 
@@ -4033,41 +3776,32 @@
           item.orders[m].req = req;
         });
       }
-
       state.editingItems[itemId] = false;
-      saveData();
-      render();
+      saveData(); render();
     }
 
     async function handleItemImageUpload(e, boothId, itemId) {
       const file = e.target.files[0];
       if (!file) return;
-      const compressed = await readFileAsCompressedDataUrl(file, 720, 0.72);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 720, 0.72);
       state.events[state.activeEventId].booths[boothId].items[itemId].itemImage = compressed;
-      saveData();
+      await saveData();
       render();
     }
 
     async function pasteItemImage(boothId, itemId) {
       try {
-        const clipboardItems = await navigator.clipboard.read();
-        for (const clipboardItem of clipboardItems) {
-          for (const type of clipboardItem.types) {
-            if (type.startsWith('image/')) {
-              const blob = await clipboardItem.getType(type);
-              const reader = new FileReader();
-              reader.onload = function(evt) {
-                state.events[state.activeEventId].booths[boothId].items[itemId].itemImage = evt.target.result;
-                saveData();
-                render();
-              };
-              reader.readAsDataURL(blob);
-              return;
-            }
-          }
+        const compressed = await extractCompressedImageFromClipboard(720, 0.72);
+        if (!compressed) {
+          alert('剪貼板中沒有找到圖片');
+          return;
         }
-        alert('剪貼板中沒有找到圖片');
-      } catch (err) { alert('無法讀取剪貼板'); }
+        state.events[state.activeEventId].booths[boothId].items[itemId].itemImage = compressed;
+        await saveData();
+        render();
+      } catch (err) {
+        alert('無法讀取剪貼板');
+      }
     }
 
     let cropState = { boothId: null, itemId: null, flyerIdx: 0, isNewItemModal: false, box: { x: 20, y: 20, w: 50, h: 50 } };
@@ -4085,7 +3819,6 @@
       const booth = state.events[state.activeEventId].booths[boothId];
       const flyers = getBoothFlyers(booth);
       const currentImg = flyers[flyerIdx] ? flyers[flyerIdx].url : '';
-
       showModal(`
         <div class="flex justify-between items-center mb-2">
           <h3 class="font-bold text-sm text-gray-800"><i class="fa-solid fa-crop-simple text-[#4A7C6F] mr-1"></i>截取商品圖片</h3>
@@ -4094,9 +3827,7 @@
         ${flyers.length > 1 ? `
           <div class="flex gap-2 overflow-x-auto pb-2 mb-2">
             ${flyers.map((f, idx) => `
-              <button onclick="switchCropFlyer(${idx})" class="px-2.5 py-1 rounded-lg text-xs font-bold border shrink-0 ${idx === flyerIdx ? 'bg-[#4A7C6F] text-white border-[#4A7C6F]' : 'bg-gray-50 text-gray-600 border-gray-200'}">
-                宣傳圖 ${idx + 1}
-              </button>
+              <button onclick="switchCropFlyer(${idx})" class="px-2.5 py-1 rounded-lg text-xs font-bold border shrink-0 ${idx === flyerIdx ? 'bg-[#4A7C6F] text-white border-[#4A7C6F]' : 'bg-gray-50 text-gray-600 border-gray-200'}">宣傳圖 ${idx + 1}</button>
             `).join('')}
           </div>
         ` : ''}
@@ -4118,26 +3849,19 @@
       bindCropEvents();
     }
 
-    function switchCropFlyer(idx) {
-      cropState.flyerIdx = idx;
-      cropState.box = { x: 20, y: 20, w: 50, h: 50 };
-      renderCropModal();
-    }
+    function switchCropFlyer(idx) { cropState.flyerIdx = idx; cropState.box = { x: 20, y: 20, w: 50, h: 50 }; renderCropModal(); }
 
     function bindCropEvents() {
       const stage = document.getElementById('crop-stage');
       const cropBox = document.getElementById('crop-box');
       if (!stage || !cropBox) return;
-
       let action = null, startX = 0, startY = 0, startBox = { ...cropState.box };
-
       const onStart = (e) => {
         const touch = e.touches ? e.touches[0] : e;
         startX = touch.clientX; startY = touch.clientY; startBox = { ...cropState.box };
         if (e.target.dataset.handle) action = e.target.dataset.handle;
         else if (e.target === cropBox || cropBox.contains(e.target)) action = 'move';
       };
-
       const onMove = (e) => {
         if (!action) return;
         e.preventDefault();
@@ -4147,33 +3871,15 @@
         const dyPct = ((touch.clientY - startY) / rect.height) * 100;
         let { x, y, w, h } = startBox;
         const minSize = 10;
-
-        if (action === 'move') {
-          x = Math.max(0, Math.min(100 - w, x + dxPct));
-          y = Math.max(0, Math.min(100 - h, y + dyPct));
-        } else if (action === 'se') {
-          w = Math.max(minSize, Math.min(100 - x, w + dxPct));
-          h = Math.max(minSize, Math.min(100 - y, h + dyPct));
-        } else if (action === 'sw') {
-          const newX = Math.max(0, Math.min(x + w - minSize, x + dxPct));
-          w = w + (x - newX); x = newX;
-          h = Math.max(minSize, Math.min(100 - y, h + dyPct));
-        } else if (action === 'ne') {
-          w = Math.max(minSize, Math.min(100 - x, w + dxPct));
-          const newY = Math.max(0, Math.min(y + h - minSize, y + dyPct));
-          h = h + (y - newY); y = newY;
-        } else if (action === 'nw') {
-          const newX = Math.max(0, Math.min(x + w - minSize, x + dxPct));
-          w = w + (x - newX); x = newX;
-          const newY = Math.max(0, Math.min(y + h - minSize, y + dyPct));
-          h = h + (y - newY); y = newY;
-        }
-
+        if (action === 'move') { x = Math.max(0, Math.min(100 - w, x + dxPct)); y = Math.max(0, Math.min(100 - h, y + dyPct)); }
+        else if (action === 'se') { w = Math.max(minSize, Math.min(100 - x, w + dxPct)); h = Math.max(minSize, Math.min(100 - y, h + dyPct)); }
+        else if (action === 'sw') { const newX = Math.max(0, Math.min(x + w - minSize, x + dxPct)); w = w + (x - newX); x = newX; h = Math.max(minSize, Math.min(100 - y, h + dyPct)); }
+        else if (action === 'ne') { w = Math.max(minSize, Math.min(100 - x, w + dxPct)); const newY = Math.max(0, Math.min(y + h - minSize, y + dyPct)); h = h + (y - newY); y = newY; }
+        else if (action === 'nw') { const newX = Math.max(0, Math.min(x + w - minSize, x + dxPct)); w = w + (x - newX); x = newX; const newY = Math.max(0, Math.min(y + h - minSize, y + dyPct)); h = h + (y - newY); y = newY; }
         cropState.box = { x, y, w, h };
         cropBox.style.left = x + '%'; cropBox.style.top = y + '%';
         cropBox.style.width = w + '%'; cropBox.style.height = h + '%';
       };
-
       const onEnd = () => { action = null; };
       stage.addEventListener('mousedown', onStart);
       window.addEventListener('mousemove', onMove);
@@ -4183,7 +3889,7 @@
       window.addEventListener('touchend', onEnd);
     }
 
-    function confirmCropImage() {
+    async function confirmCropImage() {
       const img = document.getElementById('crop-source-img');
       if (!img) return;
       const { boothId, itemId, isNewItemModal, box } = cropState;
@@ -4195,24 +3901,22 @@
       const ctx = canvas.getContext('2d');
       ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
 
-      const croppedUrl = canvas.toDataURL('image/jpeg', 0.85);
+      const croppedUrl = await compressImageDataUrl(canvas.toDataURL('image/jpeg', 0.8), 720, 0.72);
       if (isNewItemModal) {
         tempNewItemImageData = croppedUrl;
         openNewItemModal(boothId);
       } else {
         state.events[state.activeEventId].booths[boothId].items[itemId].itemImage = croppedUrl;
-        saveData(); closeModal(); render();
+        await saveData(); closeModal(); render();
       }
     }
 
     function updateBoughtQty(boothId, itemId, member, delta) {
       const item = state.events[state.activeEventId].booths[boothId].items[itemId];
       if (item.divisionCompleted) item.divisionCompleted = false;
-
       if (!item.orders[member]) item.orders[member] = { req: 0, bought: 0 };
       const nextVal = Math.max(0, (item.orders[member].bought || 0) + delta);
       item.orders[member].bought = nextVal;
-
       const allMet = Object.values(item.orders).every(o => (o.bought || 0) >= (o.req || 0));
       if (allMet && nextVal > 0) item.status = 'done';
       else if (item.status === 'done' && !allMet) item.status = 'pending';
@@ -4222,7 +3926,6 @@
     function setItemStatus(boothId, itemId, status) {
       const item = state.events[state.activeEventId].booths[boothId].items[itemId];
       if (item.divisionCompleted) item.divisionCompleted = false;
-
       if (status === 'soldout') {
         item.status = 'soldout';
         Object.keys(item.orders || {}).forEach(m => { if (item.orders[m]) item.orders[m].bought = 0; });
@@ -4282,14 +3985,12 @@
       const name = document.getElementById('new-member-name').value.trim();
       if (!name || state.members.includes(name)) return;
       state.members.push(name);
-      saveData();
-      openMemberModal();
+      saveData(); openMemberModal();
     }
 
     function removeMember(idx) {
       state.members.splice(idx, 1);
-      saveData();
-      openMemberModal();
+      saveData(); openMemberModal();
     }
 
     function openNewEventModal() {
@@ -4324,54 +4025,44 @@
               <option value="CNY|¥">人民幣 CNY (¥)</option>
             </select>
           </div>
-          <button id="btn-confirm-create-ev" type="button" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold mt-2 shadow-sm">確認建立</button>
+          <button id="btn-submit-new-ev" type="button" class="w-full btn-primary py-3 rounded-xl text-sm font-bold mt-2">確認建立</button>
         </div>
       `);
-      document.getElementById('btn-close-new-ev').addEventListener('click', closeModal);
-      document.getElementById('btn-confirm-create-ev').addEventListener('click', createEvent);
-    }
-
-    function createEvent() {
-      const nameInput = document.getElementById('ev-name');
-      const dateInput = document.getElementById('ev-date');
-      const hallInput = document.getElementById('ev-hall');
-      const currencySelect = document.getElementById('ev-currency');
-      const errorDiv = document.getElementById('ev-name-error');
-      if (!nameInput) return;
-
-      const name = nameInput.value.trim();
-      if (!name) {
-        nameInput.classList.add('border-red-500');
-        if (errorDiv) errorDiv.classList.remove('hidden');
-        nameInput.focus();
-        return;
-      }
-
-      const date = dateInput ? dateInput.value.trim() : '';
-      const hall = hallInput ? (hallInput.value.trim() || '主展館') : '主展館';
-      const [currency, currencySymbol] = (currencySelect ? currencySelect.value : 'JPY|¥').split('|');
-
-      const id = 'ev_' + Date.now();
-      if (!state.events || typeof state.events !== 'object') state.events = {};
-      
-      state.events[id] = { id, name, hall, date, currency, currencySymbol, mapImage: '', createdAt: Date.now(), booths: {} };
-      state.activeEventId = id;
-      state.settleEventId = id;
-      
-      closeModal(); saveData(); render();
+      document.getElementById('btn-close-new-ev').onclick = closeModal;
+      document.getElementById('btn-submit-new-ev').onclick = () => {
+        const nameInput = document.getElementById('ev-name');
+        const errDiv = document.getElementById('ev-name-error');
+        const name = nameInput.value.trim();
+        if (!name) { errDiv.classList.remove('hidden'); nameInput.focus(); return; }
+        errDiv.classList.add('hidden');
+        const date = document.getElementById('ev-date').value || '';
+        const hall = document.getElementById('ev-hall').value.trim();
+        const curRaw = document.getElementById('ev-currency').value.split('|');
+        const id = 'ev_' + Date.now();
+        state.events[id] = {
+          id, name, date, hall, currency: curRaw[0], currencySymbol: curRaw[1],
+          mapImage: '', createdAt: Date.now(), booths: {}
+        };
+        if (!state.runnersByEvent) state.runnersByEvent = {};
+        state.runnersByEvent[id] = [state.members[0] || '麻油'];
+        state.activeEventId = id;
+        state.settleEventId = id;
+        closeModal(); saveData(); render();
+      };
     }
 
     function openEditEventModal(evId) {
       const ev = state.events[evId];
       if (!ev) return;
+      const curVal = `${ev.currency || 'JPY'}|${ev.currencySymbol || '¥'}`;
       showModal(`
         <div class="flex justify-between items-center mb-4">
-          <h3 class="font-bold text-base">編輯活動參數</h3>
+          <h3 class="font-bold text-base">編輯展會活動</h3>
           <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
         </div>
         <div class="space-y-3">
           <div>
-            <label class="text-xs text-gray-500">活動名稱</label>
+            <label class="text-xs text-gray-500">活動名稱 *</label>
             <input id="edit-ev-name" type="text" value="${ev.name}" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
           </div>
           <div>
@@ -4385,55 +4076,47 @@
           <div>
             <label class="text-xs text-gray-500">貨幣與記號</label>
             <select id="edit-ev-currency" class="w-full border rounded-xl px-3 py-2 text-sm mt-1 font-bold bg-white">
-              <option value="JPY|¥" ${(ev.currency || 'JPY') === 'JPY' ? 'selected' : ''}>日元 JPY (¥)</option>
-              <option value="HKD|$" ${(ev.currency || '') === 'HKD' ? 'selected' : ''}>港幣 HKD ($)</option>
-              <option value="TWD|NT$" ${(ev.currency || '') === 'TWD' ? 'selected' : ''}>台幣 TWD (NT$)</option>
-              <option value="USD|$" ${(ev.currency || '') === 'USD' ? 'selected' : ''}>美元 USD ($)</option>
-              <option value="EUR|€" ${(ev.currency || '') === 'EUR' ? 'selected' : ''}>歐元 EUR (€)</option>
-              <option value="GBP|£" ${(ev.currency || '') === 'GBP' ? 'selected' : ''}>英鎊 GBP (£)</option>
-              <option value="CNY|¥" ${(ev.currency || '') === 'CNY' ? 'selected' : ''}>人民幣 CNY (¥)</option>
+              <option value="JPY|¥" ${curVal === 'JPY|¥' ? 'selected' : ''}>日元 JPY (¥)</option>
+              <option value="HKD|$" ${curVal === 'HKD|$' ? 'selected' : ''}>港幣 HKD ($)</option>
+              <option value="TWD|NT$" ${curVal === 'TWD|NT$' ? 'selected' : ''}>台幣 TWD (NT$)</option>
+              <option value="USD|$" ${curVal === 'USD|$' ? 'selected' : ''}>美元 USD ($)</option>
+              <option value="EUR|€" ${curVal === 'EUR|€' ? 'selected' : ''}>歐元 EUR (€)</option>
+              <option value="GBP|£" ${curVal === 'GBP|£' ? 'selected' : ''}>英鎊 GBP (£)</option>
+              <option value="CNY|¥" ${curVal === 'CNY|¥' ? 'selected' : ''}>人民幣 CNY (¥)</option>
             </select>
           </div>
-          <button type="button" onclick="saveEventEdit('${evId}')" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold mt-2">完成編輯</button>
-          <div class="pt-4 border-t border-gray-200 mt-2">
-            <button type="button" onclick="deleteEvent('${evId}')" class="w-full py-2.5 rounded-xl bg-red-50 text-red-600 border border-red-200 text-xs font-bold transition hover:bg-red-100">
-              <i class="fa-solid fa-triangle-exclamation mr-1"></i>刪除此活動 (危險操作)
-            </button>
+          <div class="flex gap-2 pt-2">
+            <button type="button" onclick="deleteEvent('${evId}')" class="px-4 py-2.5 rounded-xl bg-red-100 text-red-600 text-xs font-bold">刪除活動</button>
+            <button type="button" onclick="saveEditedEvent('${evId}')" class="flex-1 btn-primary py-2.5 rounded-xl text-sm font-bold shadow-sm">儲存變更</button>
           </div>
         </div>
       `);
     }
 
-    function saveEventEdit(evId) {
+    function saveEditedEvent(evId) {
       const name = document.getElementById('edit-ev-name').value.trim();
-      const date = document.getElementById('edit-ev-date').value.trim();
-      const hall = document.getElementById('edit-ev-hall').value.trim() || '主展館';
-      const [currency, currencySymbol] = document.getElementById('edit-ev-currency').value.split('|');
-
       if (!name) return alert('請輸入活動名稱');
-      state.events[evId].name = name;
-      state.events[evId].date = date;
-      state.events[evId].hall = hall;
-      state.events[evId].currency = currency;
-      state.events[evId].currencySymbol = currencySymbol;
-
+      const ev = state.events[evId];
+      ev.name = name;
+      ev.date = document.getElementById('edit-ev-date').value || '';
+      ev.hall = document.getElementById('edit-ev-hall').value.trim();
+      const curRaw = document.getElementById('edit-ev-currency').value.split('|');
+      ev.currency = curRaw[0];
+      ev.currencySymbol = curRaw[1];
       closeModal(); saveData(); render();
     }
 
     function deleteEvent(evId) {
-      const evName = state.events[evId] ? state.events[evId].name : '此活動';
-      if (!confirm(`【⚠️ 危險操作警告】\n\n確定要永久刪除「${evName}」嗎？`)) return;
+      if (!confirm('確定要刪除整個展會活動嗎？這會連帶刪除活動內所有攤位與商品，無法復原！')) return;
       delete state.events[evId];
-      const evList = getSortedEvents();
-      if (evList.length > 0) {
-        state.activeEventId = evList[0].id;
-        state.settleEventId = evList[0].id;
-      } else {
-        state.activeEventId = null;
-        state.settleEventId = null;
-      }
-      closeModal(); saveData(true); render();
-      alert('已成功刪除該活動。');
+      if (state.runnersByEvent) delete state.runnersByEvent[evId];
+      if (state.runnerOrders) delete state.runnerOrders[evId];
+      const rem = getSortedEvents();
+      state.activeEventId = rem.length > 0 ? rem[0].id : null;
+      state.settleEventId = state.activeEventId;
+      closeModal();
+      saveData(rem.length === 0);
+      render();
     }
 
     let tempNewBoothMapData = '';
@@ -4441,7 +4124,7 @@
     function openNewBoothModal() {
       tempNewBoothMapData = '';
       showModal(`
-        <div class="flex justify-between items-center mb-4">
+        <div class="flex justify-between items-center mb-3">
           <div class="flex items-center gap-2">
             <h3 class="font-bold text-base">新增攤位</h3>
             <button type="button" onclick="triggerSummonForNewBooth()" class="px-2.5 py-1 rounded-lg bg-amber-100 text-amber-800 border border-amber-300 text-xs font-bold shadow-sm hover:bg-amber-200 transition">
@@ -4453,35 +4136,36 @@
         <div class="space-y-3 max-h-[75vh] overflow-y-auto pr-1">
           <div class="grid grid-cols-2 gap-2">
             <div>
-              <label class="text-xs text-gray-500">攤位編號</label>
-              <input id="new-b-code" type="text" placeholder="例如：A-24b" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+              <label class="text-xs text-gray-500">攤位編號 *</label>
+              <input id="new-b-code" type="text" placeholder="例: B-12a" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
             </div>
             <div>
-              <label class="text-xs text-gray-500">社團名稱</label>
-              <input id="new-b-circle" type="text" placeholder="例如：八月海" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+              <label class="text-xs text-gray-500">社團名稱 *</label>
+              <input id="new-b-circle" type="text" placeholder="社團名" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
             </div>
           </div>
 
-          <div class="bg-[#F9FAF8] p-2.5 rounded-xl border space-y-2">
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border space-y-2">
             <div class="flex justify-between items-center">
-              <label class="text-[11px] font-bold text-gray-700">作者資料 * (支援多位)</label>
-              <button type="button" onclick="addNewBoothAuthorBlock()" class="text-[11px] text-[#4A7C6F] font-bold">+ 新增作者</button>
+              <label class="text-xs font-bold text-gray-700">作者資料 (可多位)</label>
+              <button type="button" onclick="addNewModalAuthorBlock()" class="text-xs text-[#4A7C6F] font-bold">+ 新增作者</button>
             </div>
-            <div id="new-b-authors-container" class="space-y-2">
-              <div class="bg-white p-2.5 rounded-xl border space-y-1.5 new-author-block relative" data-idx="0">
+            <div id="new-b-authors-list" class="space-y-2">
+              <div class="bg-white p-2.5 rounded-xl border space-y-2 new-author-block relative" data-idx="0">
                 <div class="relative">
-                  <input type="text" placeholder="作者名稱 * (必填，支援搜尋)" oninput="handleNewAuthorNameInputLive(this, 0)" class="new-b-author-name w-full border rounded-lg px-2.5 py-1.5 text-xs font-bold" autocomplete="off" />
+                  <input type="text" placeholder="作者名稱 *" oninput="handleNewAuthorNameInputLive(this, 0)" class="new-b-author-name w-full border rounded-lg px-2.5 py-1 text-xs font-bold" autocomplete="off" />
                   <div class="author-search-dropdown hidden search-dropdown"></div>
                 </div>
                 <div class="space-y-1">
                   <div class="flex justify-between items-center">
-                    <span class="text-[10px] text-gray-400">作者鏈結</span>
-                    <button type="button" onclick="addSingleAuthorLink(this)" class="text-[10px] text-[#4A7C6F] font-bold">+ 鏈結</button>
+                    <span class="text-[10px] text-gray-400">作者鏈結 (可複數)</span>
+                    <button type="button" onclick="addNewModalAuthorLink(this)" class="text-[10px] text-[#4A7C6F] font-bold">+ 鏈結</button>
                   </div>
                   <div class="author-links-list space-y-1">
                     <div class="flex gap-1 items-center">
                       <input type="text" placeholder="https://..." class="new-b-author-link flex-1 border rounded px-2 py-0.5 text-[11px]" />
                       <button type="button" onclick="pasteToInput(this)" class="px-1.5 py-0.5 bg-gray-100 rounded text-[10px] font-bold">黏貼</button>
+                      <button type="button" onclick="removeThisParent(this)" class="text-red-400 text-[10px] px-0.5"><i class="fa-solid fa-xmark"></i></button>
                     </div>
                   </div>
                 </div>
@@ -4489,145 +4173,142 @@
             </div>
           </div>
 
-          <div class="bg-[#F9FAF8] p-2.5 rounded-xl border">
-            <label class="text-[11px] font-bold text-gray-600 block mb-1">攤位圖</label>
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border">
+            <label class="text-xs font-bold text-gray-700 block mb-1.5">攤位圖 (選填)</label>
             <div class="flex items-center gap-2">
-              <div id="new-b-map-preview" class="w-10 h-10 bg-gray-200 rounded text-[9px] text-gray-400 flex items-center justify-center shrink-0">無圖</div>
-              <label class="flex-1 text-center py-1.5 px-2 bg-white border rounded text-xs cursor-pointer">
-                選擇圖片<input type="file" accept="image/*" onchange="handleNewBoothMapUpload(event)" class="hidden" />
+              <div id="new-b-map-preview" class="w-12 h-12 bg-gray-200/70 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0 overflow-hidden">無圖</div>
+              <label class="flex-1 text-center py-2 px-2 bg-white border border-gray-300 rounded-lg text-xs font-medium text-gray-700 cursor-pointer">
+                選擇圖片
+                <input type="file" accept="image/*" onchange="handleNewBoothMapUpload(event)" class="hidden" />
               </label>
-              <button type="button" onclick="pasteNewBoothMap()" class="py-1.5 px-2.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded text-xs font-bold">黏貼</button>
+              <button type="button" onclick="pasteNewBoothMap()" class="py-2 px-3 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-lg text-xs font-bold shrink-0">黏貼</button>
             </div>
           </div>
 
-          <div class="bg-[#F9FAF8] p-2.5 rounded-xl border space-y-2">
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border space-y-2">
             <div class="flex justify-between items-center">
-              <label class="text-[11px] font-bold text-gray-600">攤宣圖片與網址</label>
-              <button type="button" onclick="addNewBoothFlyerInput()" class="text-[10px] text-[#4A7C6F] font-bold">+ 新增攤宣</button>
+              <label class="text-xs font-bold text-gray-700">攤宣與鏈結 (可多張)</label>
+              <button type="button" onclick="addNewModalFlyerBlock()" class="text-xs text-[#4A7C6F] font-bold">+ 新增攤宣</button>
             </div>
-            <div id="new-b-flyers-container" class="space-y-2"></div>
+            <div id="new-b-flyers-list" class="space-y-2"></div>
           </div>
 
-          <button type="button" onclick="createBooth()" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold mt-2">儲存新攤位</button>
+          <button onclick="createBooth()" class="w-full btn-primary py-3 rounded-xl text-sm font-bold mt-2">加入攤位</button>
         </div>
       `);
     }
 
-    function addNewBoothAuthorBlock() {
-      const c = document.getElementById('new-b-authors-container');
-      if (!c) return;
-      const idx = c.children.length;
+    function addNewModalAuthorBlock() {
+      const list = document.getElementById('new-b-authors-list');
+      if (!list) return;
+      const idx = list.children.length;
       const d = document.createElement('div');
-      d.className = 'bg-white p-2.5 rounded-xl border space-y-1.5 new-author-block relative';
+      d.className = 'bg-white p-2.5 rounded-xl border space-y-2 new-author-block relative';
       d.dataset.idx = idx;
       d.innerHTML = `
         <div class="flex gap-1.5 items-center relative">
           <div class="flex-1 relative">
-            <input type="text" placeholder="作者名稱 *" oninput="handleNewAuthorNameInputLive(this, ${idx})" class="new-b-author-name w-full border rounded-lg px-2.5 py-1.5 text-xs font-bold" autocomplete="off" />
+            <input type="text" placeholder="作者名稱 *" oninput="handleNewAuthorNameInputLive(this, ${idx})" class="new-b-author-name w-full border rounded-lg px-2.5 py-1 text-xs font-bold" autocomplete="off" />
             <div class="author-search-dropdown hidden search-dropdown"></div>
           </div>
           <button type="button" onclick="removeThisParent(this.parentElement.parentElement)" class="text-red-400 px-1"><i class="fa-solid fa-trash text-xs"></i></button>
         </div>
         <div class="space-y-1">
           <div class="flex justify-between items-center">
-            <span class="text-[10px] text-gray-400">作者鏈結</span>
-            <button type="button" onclick="addSingleAuthorLink(this)" class="text-[10px] text-[#4A7C6F] font-bold">+ 鏈結</button>
+            <span class="text-[10px] text-gray-400">作者鏈結 (可複數)</span>
+            <button type="button" onclick="addNewModalAuthorLink(this)" class="text-[10px] text-[#4A7C6F] font-bold">+ 鏈結</button>
           </div>
           <div class="author-links-list space-y-1">
             <div class="flex gap-1 items-center">
               <input type="text" placeholder="https://..." class="new-b-author-link flex-1 border rounded px-2 py-0.5 text-[11px]" />
               <button type="button" onclick="pasteToInput(this)" class="px-1.5 py-0.5 bg-gray-100 rounded text-[10px] font-bold">黏貼</button>
+              <button type="button" onclick="removeThisParent(this)" class="text-red-400 text-[10px] px-0.5"><i class="fa-solid fa-xmark"></i></button>
             </div>
           </div>
         </div>
       `;
-      c.appendChild(d);
+      list.appendChild(d);
     }
 
-    function handleNewBoothMapUpload(e) {
+    function addNewModalAuthorLink(btn) {
+      const list = btn.parentElement.nextElementSibling;
+      if (!list) return;
+      const d = document.createElement('div');
+      d.className = 'flex gap-1 items-center';
+      d.innerHTML = `<input type="text" placeholder="https://..." class="new-b-author-link flex-1 border rounded px-2 py-0.5 text-[11px]" /><button type="button" onclick="pasteToInput(this)" class="px-1.5 py-0.5 bg-gray-100 rounded text-[10px] font-bold">黏貼</button><button type="button" onclick="removeThisParent(this)" class="text-red-400 text-[10px] px-0.5"><i class="fa-solid fa-xmark"></i></button>`;
+      list.appendChild(d);
+    }
+
+    function addNewModalFlyerBlock() {
+      const list = document.getElementById('new-b-flyers-list');
+      if (!list) return;
+      const d = document.createElement('div');
+      d.className = 'bg-white p-2 rounded-lg border space-y-1.5 new-b-flyer-item';
+      d.innerHTML = `
+        <div class="flex items-center gap-2">
+          <div class="w-10 h-10 bg-gray-100 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0 flyer-thumb-box" data-url="">無圖</div>
+          <div class="flex-1 space-y-1">
+            <div class="flex gap-1">
+              <input type="text" placeholder="連結 URL" class="new-b-flyer-link flex-1 border rounded px-2 py-0.5 text-[11px]" />
+              <button type="button" onclick="pasteToInput(this)" class="px-1.5 py-0.5 bg-gray-100 rounded text-[10px] font-bold">黏貼</button>
+            </div>
+            <div class="flex gap-2">
+              <label class="text-[10px] text-[#4A7C6F] font-bold cursor-pointer underline">選擇圖片<input type="file" accept="image/*" onchange="handleNewModalFlyerFile(event, this)" class="hidden" /></label>
+              <button type="button" onclick="pasteNewModalFlyerImg(this)" class="text-[10px] text-[#4A7C6F] font-bold underline">黏貼圖片</button>
+            </div>
+          </div>
+          <button type="button" onclick="removeThisParent(this.parentElement)" class="text-red-400 text-xs px-1"><i class="fa-solid fa-trash"></i></button>
+        </div>
+      `;
+      list.appendChild(d);
+    }
+
+    async function handleNewModalFlyerFile(e, inp) {
       const file = e.target.files[0];
       if (!file) return;
-      const reader = new FileReader();
-      reader.onload = function(evt) {
-        tempNewBoothMapData = evt.target.result;
-        const prev = document.getElementById('new-b-map-preview');
-        if (prev) prev.innerHTML = `<img src="${tempNewBoothMapData}" class="w-full h-full object-cover rounded" />`;
-      };
-      reader.readAsDataURL(file);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 960, 0.74);
+      const itemBox = inp.closest('.new-b-flyer-item').querySelector('.flyer-thumb-box');
+      itemBox.dataset.url = compressed;
+      itemBox.innerHTML = `<img src="${compressed}" class="w-full h-full object-cover rounded" />`;
+    }
+
+    async function pasteNewModalFlyerImg(btn) {
+      try {
+        const compressed = await extractCompressedImageFromClipboard(960, 0.74);
+        if (!compressed) return alert('剪貼板無圖片');
+        const itemBox = btn.closest('.new-b-flyer-item').querySelector('.flyer-thumb-box');
+        itemBox.dataset.url = compressed;
+        itemBox.innerHTML = `<img src="${compressed}" class="w-full h-full object-cover rounded" />`;
+      } catch (err) { alert('無法讀取剪貼板'); }
+    }
+
+    async function handleNewBoothMapUpload(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 760, 0.72);
+      tempNewBoothMapData = compressed;
+      document.getElementById('new-b-map-preview').innerHTML = `<img src="${tempNewBoothMapData}" class="w-full h-full object-cover" />`;
     }
 
     async function pasteNewBoothMap() {
       try {
-        const items = await navigator.clipboard.read();
-        for (const item of items) {
-          for (const type of item.types) {
-            if (type.startsWith('image/')) {
-              const blob = await item.getType(type);
-              const reader = new FileReader();
-              reader.onload = function(evt) {
-                tempNewBoothMapData = evt.target.result;
-                const prev = document.getElementById('new-b-map-preview');
-                if (prev) prev.innerHTML = `<img src="${tempNewBoothMapData}" class="w-full h-full object-cover rounded" />`;
-              };
-              reader.readAsDataURL(blob);
-              return;
-            }
-          }
-        }
-        alert('剪貼板無圖片');
-      } catch (e) { alert('無法讀取剪貼板'); }
-    }
-
-    function addNewBoothFlyerInput(url = '', link = '') {
-      const c = document.getElementById('new-b-flyers-container');
-      if (!c) return;
-      const d = document.createElement('div');
-      d.className = 'bg-white p-2 rounded border space-y-1.5 new-b-flyer-item';
-      d.innerHTML = `
-        <div class="flex items-center gap-2">
-          <div class="w-10 h-10 bg-gray-100 rounded flex items-center justify-center text-[9px] text-gray-400 shrink-0 flyer-thumb-box" data-url="${url}">${url ? `<img src="${url}" class="w-full h-full object-cover rounded" />` : '無圖'}</div>
-          <div class="flex-1 space-y-1">
-            <input type="text" value="${link}" placeholder="此攤宣連結 URL" class="new-b-flyer-link flex-1 border rounded px-2 py-1 text-[11px] w-full" />
-            <div class="flex gap-2">
-              <label class="text-[10px] text-[#4A7C6F] font-bold cursor-pointer underline">上傳圖片<input type="file" accept="image/*" onchange="handleNewBoothFlyerFile(event, this)" class="hidden" /></label>
-              <button type="button" onclick="removeThisParent(this.closest('.new-b-flyer-item'))" class="text-red-400 text-[10px]">刪除此攤宣</button>
-            </div>
-          </div>
-        </div>
-      `;
-      c.appendChild(d);
-    }
-
-    function handleNewBoothFlyerFile(e, fileInp) {
-      const file = e.target.files[0];
-      if (!file) return;
-      const reader = new FileReader();
-      reader.onload = function(evt) {
-        const itemDiv = fileInp.closest('.new-b-flyer-item');
-        const thumb = itemDiv.querySelector('.flyer-thumb-box');
-        thumb.dataset.url = evt.target.result;
-        thumb.innerHTML = `<img src="${evt.target.result}" class="w-full h-full object-cover rounded" />`;
-      };
-      reader.readAsDataURL(file);
+        const compressed = await extractCompressedImageFromClipboard(760, 0.72);
+        if (!compressed) return alert('剪貼板無圖片');
+        tempNewBoothMapData = compressed;
+        document.getElementById('new-b-map-preview').innerHTML = `<img src="${tempNewBoothMapData}" class="w-full h-full object-cover" />`;
+      } catch (err) { alert('無法讀取剪貼板'); }
     }
 
     function createBooth() {
-      const code = document.getElementById('new-b-code').value.trim() || '未編號';
-      const circle = document.getElementById('new-b-circle').value.trim() || '未命名社團';
-      
+      const code = document.getElementById('new-b-code').value.trim();
+      const circle = document.getElementById('new-b-circle').value.trim();
+      if (!code || !circle) return alert('請填寫攤位編號與社團名稱');
       const authorBlocks = document.querySelectorAll('.new-author-block');
       const authors = Array.from(authorBlocks).map((blk) => {
         const name = blk.querySelector('.new-b-author-name').value.trim();
         const links = Array.from(blk.querySelectorAll('.new-b-author-link')).map(i => i.value.trim()).filter(Boolean);
-        return {
-          name,
-          links,
-          sashiire: [],
-          sashiireGiven: {}
-        };
+        return { name, links, sashiire: [], sashiireGiven: {} };
       }).filter(a => a.name);
-
-      if (authors.length === 0) return alert('請至少填寫一位作者名稱！');
 
       const flyerItems = document.querySelectorAll('.new-b-flyer-item');
       const flyerImages = [];
@@ -4643,14 +4324,12 @@
       if (!ev.booths) ev.booths = {};
       const id = 'b_' + Date.now();
       const order = Object.keys(ev.booths).length + 1;
-      
       ev.booths[id] = {
         id, code, circle, authors,
         boothMapImage: tempNewBoothMapData,
         flyerImages,
         order, x: 50, y: 50, items: {}
       };
-
       tempNewBoothMapData = '';
       closeModal(); saveData(); render();
     }
@@ -4659,70 +4338,66 @@
 
     function openNewItemModal(boothId) {
       const booth = state.events[state.activeEventId].booths[boothId];
-      const boothAuthors = getBoothAuthors(booth);
-      const currentEv = state.events[state.activeEventId];
-
+      const authors = getBoothAuthors(booth);
+      const curEv = state.events[state.activeEventId];
       showModal(`
         <div class="flex justify-between items-center mb-4">
-          <div class="flex items-center gap-2">
-            <h3 class="font-bold text-base">新增購買商品</h3>
-          </div>
-          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+          <h3 class="font-bold text-base">新增商品項目</h3>
+          <button onclick="tempNewItemImageData=''; closeModal()" class="text-gray-400 text-lg">&times;</button>
         </div>
         <div class="space-y-3 max-h-[75vh] overflow-y-auto pr-1">
-          <div>
-            <label class="text-xs text-gray-500">商品名稱 *</label>
-            <input id="it-name" type="text" placeholder="例如：新刊 / 既刊" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
-          </div>
           <div class="grid grid-cols-2 gap-2">
             <div>
-              <label class="text-xs text-gray-500">單價 (${currentEv.currency || 'JPY'}) (選填)</label>
-              <input id="it-price" type="number" step="${(currentEv.currency || 'JPY') === 'JPY' ? '100' : '1'}" placeholder="${(currentEv.currency || 'JPY') === 'JPY' ? '500 (選填)' : '選填'}" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+              <label class="text-xs text-gray-500">商品名稱 *</label>
+              <input id="it-name" type="text" placeholder="例: 新刊本 / 壓克力立牌" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
             </div>
             <div>
-              <label class="text-xs text-gray-500">留貨數量</label>
-              <input id="it-reserve" type="number" min="0" value="0" placeholder="0" class="w-full border rounded-xl px-3 py-2 text-sm mt-1 font-bold text-[#4A7C6F]" />
+              <label class="text-xs text-gray-500">單價 (${curEv.currency || 'JPY'}) (選填)</label>
+              <input id="it-price" type="number" step="${(curEv.currency || 'JPY') === 'JPY' ? '100' : '1'}" placeholder="${(curEv.currency || 'JPY') === 'JPY' ? '例: 500 (選填)' : '選填'}" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
             </div>
           </div>
+          <div>
+            <label class="text-xs text-gray-500">留貨數量 (預留數量，預設 0)</label>
+            <input id="it-reserve" type="number" min="0" value="0" class="w-full border rounded-xl px-3 py-2 text-sm mt-1 font-bold text-[#4A7C6F]" />
+          </div>
 
-          <div class="bg-gray-50 p-2.5 rounded-xl border space-y-1.5">
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border space-y-1.5">
             <label class="text-xs font-bold text-gray-700 block">商品創作者 (可多選)</label>
             <div id="new-item-authors-checkboxes" class="flex flex-wrap gap-1.5 items-center">
-              ${boothAuthors.map(a => `
-                <label class="flex items-center gap-1 px-2 py-1 rounded border text-xs cursor-pointer bg-white border-gray-200">
-                  <input type="checkbox" value="${a.name}" class="new-item-author-chk w-3.5 h-3.5 accent-[#4A7C6F]" />
+              ${authors.map(a => `
+                <label class="flex items-center gap-1 px-2.5 py-1 rounded border text-xs cursor-pointer bg-white border-gray-200">
+                  <input type="checkbox" value="${a.name}" ${authors.length === 1 ? 'checked' : ''} class="new-item-author-chk w-3.5 h-3.5 accent-[#4A7C6F]" />
                   <span>${a.name}</span>
                 </label>
               `).join('')}
             </div>
             <div class="relative pt-1 flex gap-1.5 items-center">
               <div class="relative flex-1">
-                <input type="text" id="new-item-extra-author-input" placeholder="搜尋作者庫或輸入新作者名稱..." oninput="handleNewItemAuthorSearchInputLive(this)" class="w-full border rounded px-2 py-1 text-xs" autocomplete="off" />
+                <input type="text" id="new-item-extra-author-input" placeholder="搜尋作者庫或輸入新作者名稱..." oninput="handleNewItemAuthorSearchInputLive(this)" class="w-full border rounded-lg px-2.5 py-1 text-xs" autocomplete="off" />
                 <div class="new-item-author-search-dropdown hidden search-dropdown"></div>
               </div>
-              <button type="button" onclick="addInstantAuthorToNewItem()" class="px-2.5 py-1 bg-[#4A7C6F] text-white rounded text-xs font-bold shrink-0 shadow-sm">
-                + 加入
-              </button>
+              <button type="button" onclick="addInstantAuthorToNewItem()" class="px-2.5 py-1 bg-[#4A7C6F] text-white rounded-lg text-xs font-bold shrink-0 shadow-sm">+ 加入</button>
             </div>
           </div>
 
-          <div class="bg-gray-50 p-2.5 rounded-xl border space-y-1.5">
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border space-y-1.5">
             <div class="flex justify-between items-center">
-              <label class="text-[11px] font-bold text-gray-600">商品連結 URL (可複數)</label>
-              <button type="button" onclick="addNewItemLinkInput()" class="text-[10px] text-[#4A7C6F] font-bold">+ 新增連結</button>
+              <label class="text-xs font-bold text-gray-700">商品連結 URL (可複數)</label>
+              <button type="button" onclick="addNewModalItemLinkInput()" class="text-xs text-[#4A7C6F] font-bold">+ 新增連結</button>
             </div>
-            <div id="new-it-links-container" class="space-y-1">
+            <div id="new-modal-item-links-container" class="space-y-1.5">
               <div class="flex gap-1.5 items-center">
-                <input type="text" placeholder="https://..." class="new-it-link-input flex-1 border rounded px-2 py-1 text-xs" />
-                <button type="button" onclick="pasteToInput(this)" class="px-2 py-0.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded text-[10px] font-bold">黏貼</button>
+                <input type="text" placeholder="https://..." class="new-it-link-input flex-1 border rounded-xl px-3 py-1.5 text-xs" />
+                <button type="button" onclick="pasteToInput(this)" class="px-2.5 py-1.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-xl text-xs font-bold">黏貼</button>
+                <button type="button" onclick="removeThisParent(this)" class="text-red-400 px-1"><i class="fa-solid fa-trash text-xs"></i></button>
               </div>
             </div>
           </div>
 
-          <div>
-            <label class="text-xs text-gray-500 block mb-1">商品標籤</label>
-            <input id="it-tags" type="text" placeholder="例如：R-18, 漫畫" class="w-full border rounded-xl px-3 py-2 text-sm mb-1.5" />
-            <div class="text-[10px] text-gray-400 mb-1">常用標籤點擊快速新增：</div>
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border">
+            <label class="text-xs font-bold text-gray-700 block mb-1">商品標籤 (以逗號分隔)</label>
+            <input id="it-tags" type="text" placeholder="例如：R-18, 漫畫" class="w-full border rounded-xl px-3 py-1.5 text-xs mb-1.5 bg-white" />
+            <div class="text-[10px] text-gray-400 mb-1">常用標籤點擊快速加入：</div>
             <div class="flex flex-wrap gap-1">
               ${getTopTags().map(t => `
                 <button type="button" onclick="appendTagToInput('it-tags', '${t}')" class="px-2 py-0.5 bg-white border border-gray-200 rounded text-[10px] text-gray-600 hover:bg-[#4A7C6F]/10 hover:text-[#4A7C6F]">#${t}</button>
@@ -4730,24 +4405,25 @@
             </div>
           </div>
 
-          <div class="bg-gray-50 p-2.5 rounded-xl border">
-            <label class="text-[11px] font-bold text-gray-600 block mb-1">商品圖片</label>
-            <div class="flex items-center gap-2 flex-wrap">
-              <div id="new-it-img-preview" class="w-11 h-11 bg-gray-200 rounded text-[9px] text-gray-400 flex items-center justify-center shrink-0">
-                ${tempNewItemImageData ? `<img src="${tempNewItemImageData}" class="w-full h-full object-cover rounded" />` : '無圖'}
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border">
+            <label class="text-xs font-bold text-gray-700 block mb-1.5">商品圖片 (選填)</label>
+            <div class="flex items-center gap-1.5 flex-wrap">
+              <div id="new-it-img-preview" class="w-12 h-12 bg-gray-200/70 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0 overflow-hidden">
+                ${tempNewItemImageData ? `<img src="${tempNewItemImageData}" class="w-full h-full object-cover" />` : '無圖'}
               </div>
-              <label class="py-1.5 px-2.5 bg-white border rounded-lg text-xs font-medium cursor-pointer">
-                上傳<input type="file" accept="image/*" onchange="handleNewItemImageUpload(event)" class="hidden" />
+              <label class="py-2 px-2.5 bg-white border border-gray-300 rounded-lg text-xs font-medium text-gray-700 cursor-pointer">
+                上傳
+                <input type="file" accept="image/*" onchange="handleNewItemImageUpload(event)" class="hidden" />
               </label>
-              <button type="button" onclick="openCropFromFlyerModal('${boothId}', '', 0, true)" class="py-1.5 px-2.5 bg-amber-100 text-amber-800 rounded-lg text-xs font-bold">
+              <button type="button" onclick="openCropFromFlyerModal('${boothId}', 'NEW_ITEM', 0, true)" class="py-2 px-2.5 bg-amber-100 text-amber-800 rounded-lg text-xs font-bold">
                 <i class="fa-solid fa-crop-simple mr-1"></i>截取
               </button>
-              <button type="button" onclick="pasteNewItemImage()" class="py-1.5 px-2.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-lg text-xs font-bold">黏貼</button>
+              <button type="button" onclick="pasteNewItemImage()" class="py-2 px-2.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-lg text-xs font-bold">黏貼</button>
             </div>
           </div>
 
           <div class="pt-2 border-t">
-            <label class="text-xs font-bold text-gray-700 block mb-2">各成員需求數量：</label>
+            <label class="text-xs font-bold text-gray-700 block mb-2">設定各夥伴需求數量：</label>
             <div class="space-y-2">
               ${state.members.map(m => `
                 <div class="flex justify-between items-center bg-gray-50 px-3 py-2 rounded-xl">
@@ -4757,60 +4433,50 @@
               `).join('')}
             </div>
           </div>
-          <button type="button" onclick="createItem('${boothId}')" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold mt-2">加入清單</button>
+          <button onclick="createItem('${boothId}')" class="w-full btn-primary py-3 rounded-xl text-sm font-bold mt-2">儲存商品</button>
         </div>
       `);
     }
 
-    function addNewItemLinkInput() {
-      const c = document.getElementById('new-it-links-container');
-      if (!c) return;
-      const d = document.createElement('div');
-      d.className = 'flex gap-1.5 items-center';
-      d.innerHTML = `<input type="text" placeholder="https://..." class="new-it-link-input flex-1 border rounded px-2 py-1 text-xs" /><button type="button" onclick="pasteToInput(this)" class="px-2 py-0.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded text-[10px] font-bold">黏貼</button><button type="button" onclick="removeThisParent(this)" class="text-red-400 px-1"><i class="fa-solid fa-trash text-xs"></i></button>`;
-      c.appendChild(d);
+    function addNewModalItemLinkInput() {
+      const container = document.getElementById('new-modal-item-links-container');
+      if (!container) return;
+      const div = document.createElement('div');
+      div.className = 'flex gap-1.5 items-center';
+      div.innerHTML = `
+        <input type="text" placeholder="https://..." class="new-it-link-input flex-1 border rounded-xl px-3 py-1.5 text-xs" />
+        <button type="button" onclick="pasteToInput(this)" class="px-2.5 py-1.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-xl text-xs font-bold">黏貼</button>
+        <button type="button" onclick="removeThisParent(this)" class="text-red-400 px-1"><i class="fa-solid fa-trash text-xs"></i></button>
+      `;
+      container.appendChild(div);
     }
 
     async function handleNewItemImageUpload(e) {
       const file = e.target.files[0];
       if (!file) return;
-      tempNewItemImageData = await readFileAsCompressedDataUrl(file, 720, 0.72);
-      const prev = document.getElementById('new-it-img-preview');
-      if (prev) prev.innerHTML = `<img src="${tempNewItemImageData}" class="w-full h-full object-cover rounded" />`;
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 720, 0.72);
+      tempNewItemImageData = compressed;
+      document.getElementById('new-it-img-preview').innerHTML = `<img src="${tempNewItemImageData}" class="w-full h-full object-cover" />`;
     }
 
     async function pasteNewItemImage() {
       try {
-        const items = await navigator.clipboard.read();
-        for (const item of items) {
-          for (const type of item.types) {
-            if (type.startsWith('image/')) {
-              const blob = await item.getType(type);
-              const reader = new FileReader();
-              reader.onload = function(evt) {
-                tempNewItemImageData = evt.target.result;
-                const prev = document.getElementById('new-it-img-preview');
-                if (prev) prev.innerHTML = `<img src="${tempNewItemImageData}" class="w-full h-full object-cover rounded" />`;
-              };
-              reader.readAsDataURL(blob);
-              return;
-            }
-          }
-        }
-        alert('剪貼板無圖片');
-      } catch (e) { alert('無法讀取剪貼板'); }
+        const compressed = await extractCompressedImageFromClipboard(720, 0.72);
+        if (!compressed) return alert('剪貼板無圖片');
+        tempNewItemImageData = compressed;
+        document.getElementById('new-it-img-preview').innerHTML = `<img src="${tempNewItemImageData}" class="w-full h-full object-cover" />`;
+      } catch (err) { alert('無法讀取剪貼板'); }
     }
 
     function createItem(boothId) {
       const name = document.getElementById('it-name').value.trim();
       const price = parseFloat(document.getElementById('it-price').value) || 0;
       const reserve = parseInt(document.getElementById('it-reserve').value) || 0;
-      if (!name) return alert('請輸入商品名稱');
-
-      const links = Array.from(document.querySelectorAll('.new-it-link-input')).map(i => i.value.trim()).filter(Boolean);
-      const tagsInput = document.getElementById('it-tags');
-      const tags = tagsInput ? tagsInput.value.split(',').map(s => s.trim()).filter(Boolean) : [];
-
+      const tagsRaw = document.getElementById('it-tags').value.trim();
+      if (!name) return alert('請填寫商品名稱');
+      const linkInputs = document.querySelectorAll('.new-it-link-input');
+      const links = Array.from(linkInputs).map(inp => inp.value.trim()).filter(Boolean);
+      const tags = tagsRaw ? tagsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
       const authorCheckboxes = document.querySelectorAll('.new-item-author-chk:checked');
       const chosenAuthors = Array.from(authorCheckboxes).map(c => c.value);
 
@@ -4820,17 +4486,14 @@
         const req = parseInt(inp.value) || 0;
         orders[m] = { req, bought: 0 };
       });
-
-      const ev = state.events[state.activeEventId];
-      if (!ev.booths[boothId].items) ev.booths[boothId].items = {};
-      const id = 'item_' + Date.now();
-      const order = Object.keys(ev.booths[boothId].items).length + 1;
-
-      ev.booths[boothId].items[id] = {
-        id, name, price, reserve, links, tags, authors: chosenAuthors, order,
-        status: 'pending', itemImage: tempNewItemImageData, divisionCompleted: false, orders
+      const booth = state.events[state.activeEventId].booths[boothId];
+      if (!booth.items) booth.items = {};
+      const itemId = 'item_' + Date.now();
+      const order = Object.keys(booth.items).length + 1;
+      booth.items[itemId] = {
+        id: itemId, name, price, reserve, links, tags, authors: chosenAuthors,
+        order, status: 'pending', itemImage: tempNewItemImageData, divisionCompleted: false, orders
       };
-      
       tempNewItemImageData = '';
       closeModal(); saveData(); render();
     }
@@ -4838,71 +4501,58 @@
     function openMapUploadModal() {
       showModal(`
         <div class="flex justify-between items-center mb-4">
-          <h3 class="font-bold text-base">上傳會場地圖</h3>
+          <h3 class="font-bold text-base">上傳展會平面圖</h3>
           <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
         </div>
-        <p class="text-xs text-gray-500 mb-3">選擇一張會場平面圖</p>
+        <p class="text-xs text-gray-500 mb-3">選擇手機相簿中的場地圖，上傳後即可在「跑攤模式」標記各攤位座標位置。</p>
         <input type="file" accept="image/*" onchange="handleMapUpload(event)" class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-bold file:bg-[#4A7C6F]/10 file:text-[#4A7C6F]" />
       `);
     }
 
-    function handleMapUpload(e) {
+    async function handleMapUpload(e) {
       const file = e.target.files[0];
       if (!file) return;
-      const reader = new FileReader();
-      reader.onload = function(evt) {
-        state.events[state.activeEventId].mapImage = evt.target.result;
-        saveData(); closeModal();
-      };
-      reader.readAsDataURL(file);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 1100, 0.75);
+      state.events[state.activeEventId].mapImage = compressed;
+      closeModal(); await saveData(); render();
     }
 
     function openMapPinModal(boothId) {
-      const ev = state.events[state.activeEventId];
-      if (!ev.mapImage) { alert('請先在「編輯模式」點擊「會場地圖」上傳地圖圖片！'); return; }
-      const booth = ev.booths[boothId];
+      const currentEv = state.events[state.activeEventId];
+      if (!currentEv.mapImage) return alert('請先在「編輯模式」上傳會場地圖圖片！');
+      const booth = currentEv.booths[boothId];
       showModal(`
-        <div class="flex justify-between items-center mb-3">
-          <h3 class="font-bold text-base">標記 ${booth.code} 位置</h3>
+        <div class="flex justify-between items-center mb-2">
+          <h3 class="font-bold text-sm">點擊地圖標記「${booth.code} ${booth.circle}」位置</h3>
           <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
         </div>
-        <p class="text-xs text-gray-500 mb-2">直接點擊下方地圖中的攤位位置即可完成標記：</p>
-        <div class="relative border rounded-xl overflow-hidden cursor-crosshair" onclick="setBoothCoords(event, '${boothId}')">
-          <img src="${ev.mapImage}" class="w-full h-auto block" />
-          <div style="left: ${booth.x || 50}%; top: ${booth.y || 50}%;" class="absolute -translate-x-1/2 -translate-y-1/2 w-4 h-4 bg-[#D96B43] rounded-full ring-2 ring-white shadow"></div>
+        <div class="relative w-full overflow-auto border rounded-xl bg-gray-100" style="max-height: 60vh;">
+          <img id="pin-map-img" src="${currentEv.mapImage}" class="w-full h-auto block cursor-crosshair" onclick="setBoothPin(event, '${boothId}')" />
+          <div style="left: ${booth.x || 50}%; top: ${booth.y || 50}%;" class="absolute -translate-x-1/2 -translate-y-1/2 w-4 h-4 bg-[#D96B43] rounded-full ring-4 ring-white shadow-lg pointer-events-none"></div>
         </div>
       `);
     }
 
-    function setBoothCoords(e, boothId) {
-      const rect = e.currentTarget.getBoundingClientRect();
+    function setBoothPin(e, boothId) {
+      const rect = e.target.getBoundingClientRect();
       const xPct = Math.round(((e.clientX - rect.left) / rect.width) * 100);
       const yPct = Math.round(((e.clientY - rect.top) / rect.height) * 100);
-      state.events[state.activeEventId].booths[boothId].x = xPct;
-      state.events[state.activeEventId].booths[boothId].y = yPct;
-      saveData(); closeModal();
+      const booth = state.events[state.activeEventId].booths[boothId];
+      booth.x = xPct; booth.y = yPct;
+      closeModal(); saveData(); render();
     }
 
     function openNewFavModal() {
       showModal(`
         <div class="flex justify-between items-center mb-4">
-          <h3 class="font-bold text-base">新增常逛作者收藏</h3>
+          <h3 class="font-bold text-base">新增常用關注作者</h3>
           <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
         </div>
         <div class="space-y-3">
-          <div>
-            <label class="text-xs text-gray-500">社團名稱</label>
-            <input id="fav-circle" type="text" placeholder="社團名" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
-          </div>
-          <div>
-            <label class="text-xs text-gray-500">作者名稱</label>
-            <input id="fav-author" type="text" placeholder="作者名字" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
-          </div>
-          <div>
-            <label class="text-xs text-gray-500">X / Pixiv 連結</label>
-            <input id="fav-link" type="text" placeholder="https://x.com/..." class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
-          </div>
-          <button onclick="createFav()" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold mt-2">加入收藏</button>
+          <input id="fav-circle" type="text" placeholder="社團名稱 *" class="w-full border rounded-xl px-3 py-2 text-sm" />
+          <input id="fav-author" type="text" placeholder="作者名字 *" class="w-full border rounded-xl px-3 py-2 text-sm" />
+          <input id="fav-link" type="text" placeholder="主頁網址 (X / Pixiv)" class="w-full border rounded-xl px-3 py-2 text-sm" />
+          <button onclick="createFav()" class="w-full btn-primary py-3 rounded-xl text-sm font-bold">加入收藏庫</button>
         </div>
       `);
     }
@@ -4911,25 +4561,19 @@
       const circle = document.getElementById('fav-circle').value.trim();
       const author = document.getElementById('fav-author').value.trim();
       const link = document.getElementById('fav-link').value.trim();
-      if (!circle && !author) return alert('請至少填寫社團或作者名稱');
-      state.favorites.push({ id: 'fav_' + Date.now(), circle: circle || '個人社團', author: author || '未填寫', link, isStarred: false });
-      closeModal(); saveData();
+      if (!circle || !author) return alert('請填寫社團與作者名稱');
+      state.favorites.push({ id: 'fav_' + Date.now(), circle, author, link, isStarred: true });
+      closeModal(); saveData(); render();
     }
 
-    const manifestData = {
-      name: "場販計劃 - 同人展多人共編清單",
-      short_name: "場販計劃",
-      start_url: ".",
-      display: "standalone",
-      background_color: "#F4F5F0",
-      theme_color: "#4A7C6F",
-      icons: [{
-        src: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%234A7C6F'/><text x='50' y='65' font-size='50' text-anchor='middle' fill='white'>本</text></svg>",
-        sizes: "192x192",
-        type: "image/svg+xml"
-      }]
+    const manifest = {
+      name: "場販計劃 - 同人展多人共編清單", short_name: "場販計劃",
+      start_url: ".", display: "standalone", background_color: "#F4F5F0", theme_color: "#4A7C6F",
+      icons: [{ src: "https://cdn-icons-png.flaticon.com/512/3144/3144456.png", sizes: "512x512", type: "image/png" }]
     };
-    document.getElementById('manifest-placeholder').setAttribute('href', 'data:application/manifest+json;charset=utf-8,' + encodeURIComponent(JSON.stringify(manifestData)));
+    const stringManifest = JSON.stringify(manifest);
+    const blob = new Blob([stringManifest], {type: 'application/json'});
+    document.getElementById('manifest-placeholder').setAttribute('href', URL.createObjectURL(blob));
 
     initData();
   </script>
