@@ -134,6 +134,7 @@
     const LOCAL_CLOUD_STATS_KEY = 'doujin_planner_last_cloud_stats_v3';
     const LOCAL_CLOUD_SNAPSHOT_KEY = 'doujin_planner_last_cloud_snapshot_v3';
 
+    // 大容量 IndexedDB 封裝（徹底解決手機貼圖超過 localStorage 5MB 上限導致殘留舊快取的問題）
     const AppLocalDB = {
       dbName: 'DoujinPlannerIDB_v1',
       storeName: 'kvStore',
@@ -235,19 +236,19 @@
       let itemsCount = 0;
       let imagesCount = 0;
       evValues.forEach(ev => {
-        if (ev.mapImage) imagesCount++;
+        if (getImageSrc(ev.mapImage) || (typeof ev.mapImage === 'string' && ev.mapImage.startsWith('rtdb_media:'))) imagesCount++;
         if (ev && ev.booths && typeof ev.booths === 'object') {
           const bList = Object.values(ev.booths).filter(Boolean);
           boothsCount += bList.length;
           bList.forEach(b => {
-            if (b.boothMapImage) imagesCount++;
+            if (getImageSrc(b.boothMapImage) || (typeof b.boothMapImage === 'string' && b.boothMapImage.startsWith('rtdb_media:'))) imagesCount++;
             if (Array.isArray(b.flyerImages)) {
-              b.flyerImages.forEach(f => { if (f && f.url) imagesCount++; });
+              b.flyerImages.forEach(f => { if (f && (getImageSrc(f.url) || (typeof f.url === 'string' && f.url.startsWith('rtdb_media:')))) imagesCount++; });
             }
             if (b && b.items && typeof b.items === 'object') {
               const itList = Object.values(b.items).filter(Boolean);
               itemsCount += itList.length;
-              itList.forEach(it => { if (it.itemImage) imagesCount++; });
+              itList.forEach(it => { if (getImageSrc(it.itemImage) || (typeof it.itemImage === 'string' && it.itemImage.startsWith('rtdb_media:'))) imagesCount++; });
             }
           });
         }
@@ -393,6 +394,7 @@
       }
     }
 
+    // 統一圖片壓縮工具（支援 DataURL、File、Clipboard Blob）
     function compressImageDataUrl(dataUrl, maxWidth = 720, quality = 0.72) {
       return new Promise((resolve) => {
         if (!dataUrl || !dataUrl.startsWith('data:image/')) {
@@ -518,6 +520,7 @@
         await AppLocalDB.set('doujin_planner_backup_v3', serialized);
       }
 
+      // 只有在本地資料「確實成功寫入 IndexedDB/localStorage」時，才允許標記待同步，絕不留下殘留舊快取卻標記待同步的狀態！
       if (markPending && savedOk) {
         hasPendingLocalChanges = true;
         localPendingTimestamp = localStateUpdatedAt;
@@ -637,10 +640,12 @@
             return;
           }
 
+          // 若本地標記有待同步變更，先比對「雲端與本地誰才是真正較新／較完整的資料」
           if (hasPendingLocalChanges) {
             const currentPayload = getPersistablePayload();
             const currentStats = countDataStats(currentPayload);
 
+            // 情況 1：本地無有效資料但雲端有資料 -> 直接採納雲端，清除錯誤待同步旗標
             if (!hasAnyMeaningfulData(currentPayload) && cloudMeaningful) {
               clearPendingFlag();
               applyLoadedData(val);
@@ -650,6 +655,7 @@
               return;
             }
 
+            // 情況 2：雲端時間戳記比本地更新，或雲端攤位／圖片數多於本地（代表跨裝置已更新成功，本地只是殘留舊快取）
             if (cloudMeaningful && (
               (cloudStats.updatedAt > 0 && currentStats.updatedAt > 0 && cloudStats.updatedAt >= currentStats.updatedAt) ||
               (cloudStats.boothsCount > currentStats.boothsCount) ||
@@ -663,6 +669,7 @@
               return;
             }
 
+            // 情況 3：確認本地確實有尚未上傳的新變更且有效 -> 推播到雲端
             if (hasAnyMeaningfulData(currentPayload)) {
               syncToCloudIfNeeded(false);
               return;
@@ -732,7 +739,141 @@
       return JSON.parse(JSON.stringify(obj, (k, v) => v === undefined ? null : v));
     }
 
-    async function saveData(allowEmptyOverwrite = false) {
+    // ==========================================
+    // 局部更新 (PARTIAL UPDATE) & 圖片分流壓縮輔助
+    // ==========================================
+    const MEDIA_PREFIX = 'rtdb_media:';
+    const mediaMemoryCache = {};
+    let partialSyncTimer = null;
+    const pendingPartialPaths = new Map();
+
+    const IMAGE_PRESETS = {
+      item: { maxWidth: 560, quality: 0.68 },
+      boothMap: { maxWidth: 560, quality: 0.68 },
+      flyer: { maxWidth: 800, quality: 0.70 },
+      eventMap: { maxWidth: 960, quality: 0.72 }
+    };
+
+    function estimateByteSize(obj) {
+      try {
+        return new Blob([JSON.stringify(obj)]).size;
+      } catch (e) {
+        return 0;
+      }
+    }
+
+    async function externalizeLargeImage(dataUrl, thresholdBytes = 120000) {
+      if (!dataUrl || typeof dataUrl !== 'string') return '';
+      if (dataUrl.startsWith(MEDIA_PREFIX)) return dataUrl;
+      if (!dataUrl.startsWith('data:image/')) return dataUrl;
+
+      const bytes = new Blob([dataUrl]).size;
+      if (bytes <= thresholdBytes || !useFirebase || !db) {
+        return dataUrl;
+      }
+
+      const mediaId = 'img_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+      const fullRefStr = MEDIA_PREFIX + mediaId;
+      mediaMemoryCache[fullRefStr] = dataUrl;
+
+      try {
+        await db.ref(`doujinPlannerMedia/${mediaId}`).set({
+          data: dataUrl,
+          updatedAt: Date.now()
+        });
+        return fullRefStr;
+      } catch (err) {
+        console.warn('獨立圖片節點寫入失敗，退回主資料保留:', err);
+        return dataUrl;
+      }
+    }
+
+    function getImageSrc(val) {
+      if (!val) return '';
+      if (typeof val !== 'string') return '';
+      if (val.startsWith(MEDIA_PREFIX)) {
+        if (mediaMemoryCache[val]) return mediaMemoryCache[val];
+        const mediaId = val.slice(MEDIA_PREFIX.length);
+        if (useFirebase && db && mediaId) {
+          db.ref(`doujinPlannerMedia/${mediaId}/data`).once('value').then((snap) => {
+            const d = snap.val();
+            if (d && mediaMemoryCache[val] !== d) {
+              mediaMemoryCache[val] = d;
+              const activeTag = document.activeElement ? document.activeElement.tagName : '';
+              if (activeTag !== 'INPUT' && activeTag !== 'TEXTAREA') {
+                render();
+              }
+            }
+          }).catch(() => {});
+        }
+        return '';
+      }
+      return val;
+    }
+
+    function queuePartialCloudUpdate(relPath, value) {
+      if (!useFirebase || !db) return;
+      const cleanPath = String(relPath || '').replace(/^\/+|\/+$/g, '');
+      const fullPath = cleanPath ? `doujinPlanner/${cleanPath}` : 'doujinPlanner';
+      pendingPartialPaths.set(fullPath, sanitizeForFirebase(value));
+      pendingPartialPaths.set('doujinPlanner/updatedAt', Date.now());
+
+      if (partialSyncTimer) clearTimeout(partialSyncTimer);
+      partialSyncTimer = setTimeout(() => {
+        flushPartialCloudUpdates();
+      }, 350);
+    }
+
+    async function flushPartialCloudUpdates() {
+      if (!useFirebase || !db) return;
+      if (!hasCloudInitialLoadCompleted) return;
+      if (pendingPartialPaths.size === 0) return;
+
+      const meaningful = hasAnyMeaningfulData(getPersistablePayload());
+      if (!meaningful) {
+        pendingPartialPaths.clear();
+        return;
+      }
+
+      const updates = {};
+      pendingPartialPaths.forEach((v, k) => {
+        updates[k] = v;
+      });
+      pendingPartialPaths.clear();
+
+      const payloadSize = estimateByteSize(updates);
+      if (payloadSize > 2 * 1024 * 1024) {
+        console.warn('單次局部更新體積過大 (' + payloadSize + ' bytes)，改為完整同步檢查');
+        hasPendingLocalChanges = true;
+        syncToCloudIfNeeded(true);
+        return;
+      }
+
+      isUploadingToCloud = true;
+      updateSyncBadge('uploading', '局部同步中...');
+
+      try {
+        await Promise.race([
+          db.ref().update(updates),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('雲端局部寫入逾時')), 20000))
+        ]);
+        isUploadingToCloud = false;
+        clearPendingFlag();
+        saveKnownCloudStats(countDataStats(getPersistablePayload()));
+        const nowStr = formatClockTime();
+        safeSetStorage(LOCAL_LAST_SAVED_KEY, nowStr);
+        updateLastSavedDisplay(nowStr);
+        updateSyncBadge('synced', '已連線 · 已儲存');
+      } catch (err) {
+        isUploadingToCloud = false;
+        hasPendingLocalChanges = true;
+        safeSetStorage(LOCAL_PENDING_KEY, 'true');
+        console.warn('局部同步失敗，已保留本地並等待重試:', err);
+        updateSyncBadge('pending', '本地已存 · 待重試');
+      }
+    }
+
+    async function saveData(allowEmptyOverwrite = false, partialPath = null, partialValue = undefined) {
       localStateUpdatedAt = Date.now();
       const payloadCheck = getPersistablePayload(localStateUpdatedAt);
       const meaningful = hasAnyMeaningfulData(payloadCheck);
@@ -745,8 +886,13 @@
           updateSyncBadge('error', '本地為空 · 已禁止寫入雲端');
           return;
         }
-        updateSyncBadge('pending', '本地已存 · 同步中');
-        syncToCloudIfNeeded(false, allowEmptyOverwrite);
+        if (partialPath && partialValue !== undefined) {
+          updateSyncBadge('pending', '本地已存 · 局部同步中');
+          queuePartialCloudUpdate(partialPath, partialValue);
+        } else {
+          updateSyncBadge('pending', '本地已存 · 同步中');
+          syncToCloudIfNeeded(false, allowEmptyOverwrite);
+        }
       } else {
         const nowStr = formatClockTime();
         safeSetStorage(LOCAL_LAST_SAVED_KEY, nowStr);
@@ -808,6 +954,7 @@
       const currentSeq = ++uploadSequence;
       updateSyncBadge('uploading', '同步雲端中...');
 
+      // 給予行動網路充足的上傳時間（25 秒），避免大圖上傳到一半被提早切斷而留下假性待重試旗標
       const setPromise = db.ref('doujinPlanner').set(payload);
       const timeoutPromise = new Promise((_, reject) => {
         setTimeout(() => reject(new Error('雲端寫入逾時')), 25000);
@@ -1239,14 +1386,13 @@
 
                 <div class="bg-[#F9FAF8] p-2.5 rounded-xl border border-gray-200/70">
                   <label class="text-[11px] font-bold text-gray-600 block mb-1.5">攤位圖</label>
-                  <div class="flex items-center gap-1.5 flex-wrap">
-                    ${b.boothMapImage ? `<img src="${b.boothMapImage}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : '<div class="w-11 h-11 bg-gray-200/70 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
+                  <div class="flex items-center gap-2">
+                    ${b.boothMapImage ? `<img src="${getImageSrc(b.boothMapImage)}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : '<div class="w-11 h-11 bg-gray-200/70 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
                     <label class="flex-1 text-center py-2 px-2 bg-white border border-gray-300 rounded-lg text-xs font-medium text-gray-700 cursor-pointer">
                       選擇圖片
                       <input type="file" accept="image/*" onchange="handleBoothMapUpload(event, '${b.id}')" class="hidden" />
                     </label>
                     <button type="button" onclick="pasteBoothMap('${b.id}')" class="py-2 px-3 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-lg text-xs font-bold shrink-0">黏貼</button>
-                    ${b.boothMapImage ? `<button type="button" onclick="clearBoothMap('${b.id}')" class="py-2 px-2.5 bg-red-50 text-red-600 border border-red-200 rounded-lg text-xs font-bold shrink-0"><i class="fa-solid fa-eraser mr-1"></i>清除</button>` : ''}
                   </div>
                 </div>
 
@@ -1258,19 +1404,18 @@
                   ${flyers.map((flyer, fIdx) => `
                     <div class="bg-white p-2 rounded-lg border space-y-1.5">
                       <div class="flex items-center gap-2">
-                        ${flyer.url ? `<img src="${flyer.url}" class="w-12 h-12 object-cover rounded border shrink-0" />` : '<div class="w-12 h-12 bg-gray-100 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
+                        ${getImageSrc(flyer.url) ? `<img src="${getImageSrc(flyer.url)}" class="w-12 h-12 object-cover rounded border shrink-0" />` : '<div class="w-12 h-12 bg-gray-100 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
                         <div class="flex-1 space-y-1">
                           <div class="flex gap-1">
                             <input type="text" value="${flyer.link || ''}" placeholder="此張攤宣對應的連結 URL" class="flyer-link-input-${b.id}-${fIdx} flex-1 border rounded px-2 py-1 text-[11px]" />
                             <button type="button" onclick="pasteToInput(this)" class="px-2 py-0.5 bg-gray-100 rounded text-[10px] font-bold">黏貼</button>
                           </div>
-                          <div class="flex gap-2 flex-wrap">
+                          <div class="flex gap-2">
                             <label class="text-[10px] text-[#4A7C6F] font-bold cursor-pointer underline">更換圖片<input type="file" accept="image/*" onchange="handleSingleBoothFlyerUpload(event, '${b.id}', ${fIdx})" class="hidden" /></label>
                             <button type="button" onclick="pasteSingleBoothFlyer('${b.id}', ${fIdx})" class="text-[10px] text-[#4A7C6F] font-bold underline">黏貼圖片</button>
-                            ${flyer.url ? `<button type="button" onclick="clearSingleBoothFlyerImage('${b.id}', ${fIdx})" class="text-[10px] text-red-500 font-bold underline">清除圖片</button>` : ''}
                           </div>
                         </div>
-                        <button type="button" onclick="removeBoothFlyer('${b.id}', ${fIdx})" class="text-red-400 text-xs px-1" title="刪除此欄"><i class="fa-solid fa-trash"></i></button>
+                        <button type="button" onclick="removeBoothFlyer('${b.id}', ${fIdx})" class="text-red-400 text-xs px-1"><i class="fa-solid fa-trash"></i></button>
                       </div>
                     </div>
                   `).join('')}
@@ -1289,7 +1434,7 @@
                   <div class="drag-handle cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-700 px-1 py-2 touch-none select-none" data-booth-id="${b.id}" data-idx="${idx}" title="按住拖曳排序，或輕點調整">
                     <i class="fa-solid fa-bars text-sm"></i>
                   </div>
-                  ${b.boothMapImage ? `<img src="${b.boothMapImage}" class="${boothMapImgSize} object-cover rounded-lg border shrink-0 transition-all" title="攤位圖" />` : ''}
+                  ${b.boothMapImage ? `<img src="${getImageSrc(b.boothMapImage)}" class="${boothMapImgSize} object-cover rounded-lg border shrink-0 transition-all" title="攤位圖" />` : ''}
                   <span class="bg-[#4A7C6F]/10 text-[#4A7C6F] font-bold text-xs px-2 py-1 rounded-md shrink-0">
                     ${String(idx + 1).padStart(2, '0')}
                   </span>
@@ -1419,7 +1564,7 @@
                     <div class="bg-white p-2.5 rounded-lg border">
                       <label class="text-[10px] text-gray-600 font-bold block mb-1">商品圖片</label>
                       <div class="flex items-center gap-1.5 flex-wrap">
-                        ${it.itemImage ? `<img src="${it.itemImage}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : '<div class="w-11 h-11 bg-gray-200 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
+                        ${it.itemImage ? `<img src="${getImageSrc(it.itemImage)}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : '<div class="w-11 h-11 bg-gray-200 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
                         <label class="py-1.5 px-2.5 bg-gray-50 border border-gray-300 rounded-lg text-xs font-medium text-gray-700 cursor-pointer">
                           上傳
                           <input type="file" accept="image/*" onchange="handleItemImageUpload(event, '${b.id}', '${it.id}')" class="hidden" />
@@ -1428,7 +1573,6 @@
                           <i class="fa-solid fa-crop-simple mr-1"></i>截取
                         </button>
                         <button type="button" onclick="pasteItemImage('${b.id}', '${it.id}')" class="py-1.5 px-2.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-lg text-xs font-bold">黏貼</button>
-                        ${it.itemImage ? `<button type="button" onclick="clearItemImage('${b.id}', '${it.id}')" class="py-1.5 px-2.5 bg-red-50 text-red-600 border border-red-200 rounded-lg text-xs font-bold"><i class="fa-solid fa-eraser mr-1"></i>清除</button>` : ''}
                       </div>
                     </div>
                     <div class="pt-2 border-t border-gray-300/60">
@@ -1449,7 +1593,7 @@
                 ` : `
                   <div class="flex justify-between items-center item-box-deep-green p-2.5 rounded-xl">
                     <div class="flex items-center gap-2.5">
-                      ${it.itemImage ? `<img src="${it.itemImage}" class="${imgSizeClass} object-cover rounded-lg border border-white shrink-0 transition-all" />` : ''}
+                      ${it.itemImage ? `<img src="${getImageSrc(it.itemImage)}" class="${imgSizeClass} object-cover rounded-lg border border-white shrink-0 transition-all" />` : ''}
                       <div>
                         <div class="text-sm font-bold text-[#2C3531] flex items-center gap-1 flex-wrap">
                           ${it.name}
@@ -1889,7 +2033,7 @@
       `;
 
       if (state.runMode === 'map') {
-        if (!currentEv.mapImage) {
+        if (!getImageSrc(currentEv.mapImage)) {
           html += `
             <div class="card p-8 text-center">
               <i class="fa-solid fa-map-location-dot text-4xl text-gray-300 mb-3"></i>
@@ -1902,7 +2046,7 @@
             <div class="card p-2 overflow-hidden relative">
               <div class="text-xs text-gray-400 mb-2 px-2">點擊攤位標籤可快速查看</div>
               <div class="relative w-full overflow-auto border rounded-xl bg-gray-100" style="max-height: 65vh;">
-                <img src="${currentEv.mapImage}" class="w-full h-auto block" />
+                <img src="${getImageSrc(currentEv.mapImage)}" class="w-full h-auto block" />
                 ${booths.map((b, i) => {
                   const itemsArr = Object.values(b.items || {});
                   const isDone = itemsArr.length > 0 && itemsArr.every(it => {
@@ -1964,7 +2108,7 @@
                 <div class="drag-handle cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-700 px-1.5 py-2 touch-none select-none" data-booth-id="${b.id}" data-idx="${idx}" title="按住拖曳排序，或輕點調整">
                   <i class="fa-solid fa-bars text-sm"></i>
                 </div>
-                ${b.boothMapImage ? `<img src="${b.boothMapImage}" class="${boothMapImgSize} object-cover rounded-lg border shrink-0 transition-all" title="攤位圖" />` : ''}
+                ${b.boothMapImage ? `<img src="${getImageSrc(b.boothMapImage)}" class="${boothMapImgSize} object-cover rounded-lg border shrink-0 transition-all" title="攤位圖" />` : ''}
                 <div>
                   <div class="flex items-center gap-2 flex-wrap">
                     <span class="text-xs font-bold text-[#4A7C6F]">#${idx + 1}</span>
@@ -2013,7 +2157,7 @@
                   <div class="item-box-deep-green p-3 rounded-xl">
                     <div class="flex justify-between items-start mb-2">
                       <div class="flex items-center gap-2.5">
-                        ${it.itemImage ? `<img src="${it.itemImage}" class="${runImgClass} object-cover rounded-lg border border-white shrink-0 transition-all" />` : ''}
+                        ${it.itemImage ? `<img src="${getImageSrc(it.itemImage)}" class="${runImgClass} object-cover rounded-lg border border-white shrink-0 transition-all" />` : ''}
                         <div>
                           <div class="font-bold text-sm text-[#2C3531] flex items-center flex-wrap gap-1">
                             ${it.name}
@@ -2126,3 +2270,2458 @@
       state.activeRunner = name;
       closeModal(); saveData(); render();
     }
+
+    function createAndAddRunner() {
+      const inp = document.getElementById('instant-new-runner-name');
+      if (!inp) return;
+      const name = inp.value.trim();
+      if (!name) return alert('請輸入名稱');
+      if (!state.members.includes(name)) state.members.push(name);
+      confirmAddRunner(name);
+    }
+
+    function openEditRunnersModal() {
+      const evId = state.activeEventId;
+      const existingRunners = (state.runnersByEvent && state.runnersByEvent[evId]) || [];
+      showModal(`
+        <div class="flex justify-between items-center mb-4">
+          <h3 class="font-bold text-base">編輯跑攤人名單</h3>
+          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="space-y-2">
+          ${existingRunners.length === 0 ? '<div class="text-xs text-gray-400 py-4 text-center">尚未新增任何跑攤人</div>' : existingRunners.map((r, idx) => `
+            <div class="flex justify-between items-center bg-gray-50 px-3 py-2.5 rounded-xl text-sm font-bold">
+              <span>${r}</span>
+              <button onclick="removeRunnerFromEvent(${idx})" class="text-red-500 text-xs px-2 py-1 bg-red-50 rounded-lg">移除跑攤人</button>
+            </div>
+          `).join('')}
+        </div>
+      `);
+    }
+
+    function removeRunnerFromEvent(idx) {
+      const evId = state.activeEventId;
+      const removed = state.runnersByEvent[evId].splice(idx, 1)[0];
+      if (state.activeRunner === removed) state.activeRunner = 'all';
+      saveData(); openEditRunnersModal();
+    }
+
+    function applyRunnerOrderPreset(type) {
+      const runner = state.activeRunner;
+      if (!runner || runner === 'all' || !type) return;
+      const ev = state.events[state.activeEventId];
+      if (!ev || !ev.booths) return;
+      if (!state.runnerOrders[ev.id]) state.runnerOrders[ev.id] = {};
+      if (type === 'default') {
+        state.runnerOrders[ev.id][runner] = Object.values(ev.booths).sort((a, b) => (a.order || 0) - (b.order || 0)).map(b => b.id);
+      } else if (type === 'az') {
+        state.runnerOrders[ev.id][runner] = Object.values(ev.booths).sort((a, b) => (a.code || '').localeCompare(b.code || '', undefined, { numeric: true, sensitivity: 'base' })).map(b => b.id);
+      } else {
+        const otherOrder = state.runnerOrders[ev.id][type] || Object.values(ev.booths).sort((a, b) => (a.order || 0) - (b.order || 0)).map(b => b.id);
+        state.runnerOrders[ev.id][runner] = [...otherOrder];
+      }
+      saveData(); render();
+    }
+
+    function updateRunnerPurchaseQty(boothId, itemId, delta) {
+      const runner = state.activeRunner || 'all';
+      const item = state.events[state.activeEventId].booths[boothId].items[itemId];
+      if (item.divisionCompleted) item.divisionCompleted = false;
+
+      if (runner !== 'all') {
+        if (!item.purchasedBy) item.purchasedBy = {};
+        const prev = item.purchasedBy[runner] || 0;
+        const next = Math.max(0, prev + delta);
+        const actualDelta = next - prev;
+        if (actualDelta === 0) return;
+        item.purchasedBy[runner] = next;
+        updateTotalBoughtQty(boothId, itemId, actualDelta, runner);
+      } else {
+        if (delta > 0) openAllOverviewAddBuyerModal(boothId, itemId);
+        else if (delta < 0) openAllOverviewRemoveBuyerModal(boothId, itemId);
+      }
+    }
+
+    function openAllOverviewAddBuyerModal(boothId, itemId) {
+      const evId = state.activeEventId;
+      const item = state.events[evId].booths[boothId].items[itemId];
+      const eventRunners = (state.runnersByEvent && state.runnersByEvent[evId]) || [];
+      const orderedMembers = [...eventRunners, ...state.members.filter(m => !eventRunners.includes(m))];
+      showModal(`
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <h3 class="font-bold text-base text-gray-800">是誰買到【${item.name}】？</h3>
+            <p class="text-xs text-gray-400">請選擇購買的成員，或即時新增成員</p>
+          </div>
+          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="space-y-4">
+          <div>
+            <label class="text-xs font-bold text-gray-700 block mb-2">1. 從成員名單選擇：</label>
+            <div class="flex flex-wrap gap-2">
+              ${orderedMembers.map(m => {
+                const isRunner = eventRunners.includes(m);
+                const curCnt = (item.purchasedBy && item.purchasedBy[m]) || 0;
+                return `
+                  <button type="button" onclick="confirmAllOverviewAddBuyer('${boothId}', '${itemId}', '${m.replace(/'/g, "\'")}')" class="px-3.5 py-2 rounded-xl text-xs font-bold border transition flex items-center gap-1.5 ${isRunner ? 'bg-[#4A7C6F]/10 text-[#4A7C6F] border-[#4A7C6F]/40 hover:bg-[#4A7C6F] hover:text-white' : 'bg-gray-50 text-gray-700 border-gray-200 hover:bg-[#4A7C6F] hover:text-white'}">
+                    <span>${m}</span>
+                    ${curCnt > 0 ? `<span class="px-1.5 py-0.2 rounded-full bg-white/80 text-[10px] text-[#4A7C6F]">已買${curCnt}</span>` : ''}
+                  </button>
+                `;
+              }).join('')}
+            </div>
+          </div>
+          <div class="pt-3 border-t">
+            <label class="text-xs font-bold text-gray-700 block mb-1.5">2. 或即時輸入新成員並選擇：</label>
+            <div class="flex gap-2">
+              <input id="all-overview-new-buyer-name" type="text" placeholder="輸入新成員名字 (例: 小幫手B)" class="flex-1 border rounded-xl px-3 py-2 text-sm" />
+              <button type="button" onclick="createAndSelectAllOverviewBuyer('${boothId}', '${itemId}')" class="btn-primary px-4 py-2 rounded-xl text-xs font-bold shrink-0">新增並選擇</button>
+            </div>
+          </div>
+        </div>
+      `);
+    }
+
+    function confirmAllOverviewAddBuyer(boothId, itemId, buyerName) {
+      const evId = state.activeEventId;
+      const item = state.events[evId].booths[boothId].items[itemId];
+      if (!state.members.includes(buyerName)) state.members.push(buyerName);
+      if (!state.runnersByEvent[evId]) state.runnersByEvent[evId] = [];
+      if (!state.runnersByEvent[evId].includes(buyerName)) state.runnersByEvent[evId].push(buyerName);
+      if (!item.purchasedBy) item.purchasedBy = {};
+      item.purchasedBy[buyerName] = (item.purchasedBy[buyerName] || 0) + 1;
+      closeModal();
+      updateTotalBoughtQty(boothId, itemId, 1, buyerName);
+    }
+
+    function createAndSelectAllOverviewBuyer(boothId, itemId) {
+      const inp = document.getElementById('all-overview-new-buyer-name');
+      if (!inp) return;
+      const name = inp.value.trim();
+      if (!name) return alert('請輸入新成員名稱');
+      confirmAllOverviewAddBuyer(boothId, itemId, name);
+    }
+
+    function openAllOverviewRemoveBuyerModal(boothId, itemId) {
+      const evId = state.activeEventId;
+      const item = state.events[evId].booths[boothId].items[itemId];
+      const purchasedBy = item.purchasedBy || {};
+      const activeBuyers = Object.entries(purchasedBy).filter(([_, cnt]) => cnt > 0);
+      const totalBought = Object.values(item.orders || {}).reduce((s, o) => s + (o.bought || 0), 0);
+      if (activeBuyers.length === 0) {
+        if (totalBought > 0) updateTotalBoughtQty(boothId, itemId, -1, state.members[0]);
+        return;
+      }
+      showModal(`
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <h3 class="font-bold text-base text-gray-800">減少【${item.name}】購買數量</h3>
+            <p class="text-xs text-gray-400">請選擇要減少哪一位跑攤人的購買數量（-1）</p>
+          </div>
+          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="space-y-2">
+          ${activeBuyers.map(([rName, cnt]) => `
+            <button type="button" onclick="confirmAllOverviewRemoveBuyer('${boothId}', '${itemId}', '${rName.replace(/'/g, "\'")}')" class="w-full flex justify-between items-center bg-gray-50 hover:bg-red-50 border border-gray-200 hover:border-red-200 px-4 py-3 rounded-xl text-sm font-bold text-gray-800 transition">
+              <span><i class="fa-solid fa-person-walking text-[#4A7C6F] mr-2"></i>${rName}</span>
+              <span class="text-xs text-[#D96B43] bg-white px-2.5 py-1 rounded-lg border">目前買到 ${cnt} 件 ➔ 減 1</span>
+            </button>
+          `).join('')}
+        </div>
+      `);
+    }
+
+    function confirmAllOverviewRemoveBuyer(boothId, itemId, runnerName) {
+      const evId = state.activeEventId;
+      const item = state.events[evId].booths[boothId].items[itemId];
+      if (item.purchasedBy && (item.purchasedBy[runnerName] || 0) > 0) {
+        item.purchasedBy[runnerName] = Math.max(0, item.purchasedBy[runnerName] - 1);
+      }
+      closeModal();
+      updateTotalBoughtQty(boothId, itemId, -1, runnerName);
+    }
+
+    function updateTotalBoughtQty(boothId, itemId, delta, preferredMember = null) {
+      const item = state.events[state.activeEventId].booths[boothId].items[itemId];
+      const members = state.members;
+      if (item.divisionCompleted) item.divisionCompleted = false;
+
+      if (delta > 0) {
+        const totalReq = members.reduce((s, m) => s + ((item.orders[m] && item.orders[m].req) || 0), 0);
+        const currentTotalBought = members.reduce((s, m) => s + ((item.orders[m] && item.orders[m].bought) || 0), 0);
+        if (currentTotalBought < totalReq || totalReq === 0) {
+          let targetM = null;
+          if (preferredMember && item.orders[preferredMember] && (item.orders[preferredMember].req || 0) > 0 && item.orders[preferredMember].bought < item.orders[preferredMember].req) {
+            targetM = preferredMember;
+          } else {
+            targetM = members.find(m => {
+              const o = item.orders[m] || { req: 0, bought: 0 };
+              return (o.req || 0) > 0 && o.bought < o.req;
+            });
+          }
+          if (targetM) {
+            if (!item.orders[targetM]) item.orders[targetM] = { req: 0, bought: 0 };
+            item.orders[targetM].bought += delta;
+          }
+        }
+      } else if (delta < 0) {
+        let targetM = members.slice().reverse().find(m => {
+          const o = item.orders[m] || { req: 0, bought: 0 };
+          return o.bought > 0;
+        }) || members[0];
+        if (!item.orders[targetM]) item.orders[targetM] = { req: 0, bought: 0 };
+        item.orders[targetM].bought = Math.max(0, item.orders[targetM].bought + delta);
+      }
+
+      const totalReq = members.reduce((s, m) => s + ((item.orders[m] && item.orders[m].req) || 0), 0);
+      const updatedTotal = members.reduce((s, m) => s + ((item.orders[m] && item.orders[m].bought) || 0), 0);
+      const allMet = totalReq > 0 && updatedTotal >= totalReq;
+      if (allMet && updatedTotal > 0) item.status = 'done';
+      else if (item.status === 'done' && !allMet) item.status = 'pending';
+
+      saveData();
+    }
+
+    function toggleBoothSashiireGiven(boothId, memberName, isChecked) {
+      const booth = state.events[state.activeEventId].booths[boothId];
+      const authors = getBoothAuthors(booth);
+      authors.forEach(a => {
+        if ((a.sashiire || []).includes(memberName)) {
+          if (!a.sashiireGiven) a.sashiireGiven = {};
+          a.sashiireGiven[memberName] = isChecked;
+        }
+      });
+      booth.authors = authors;
+      saveData();
+    }
+
+    function toggleRunItemExpand(itemId) {
+      state.expandedRunItems[itemId] = !state.expandedRunItems[itemId];
+      render();
+    }
+
+    // ------------------------------------------
+    // 分頁 3：分帳結算與商品瓜分
+    // ------------------------------------------
+    function renderSettleTab(container) {
+      const evList = getSortedEvents();
+      if (evList.length === 0) {
+        container.innerHTML = `<div class="card p-8 text-center text-gray-400">尚無活動資料</div>`;
+        return;
+      }
+
+      if (!state.settleEventId || !state.events[state.settleEventId]) {
+        state.settleEventId = evList[0].id;
+      }
+      const currentEv = state.events[state.settleEventId];
+      const eventRunners = (state.runnersByEvent && state.runnersByEvent[currentEv.id]) || [];
+
+      let planTotal = 0, boughtTotal = 0, pendingTotal = 0, doneBoothsCount = 0;
+      const runnerSpentMap = {};
+      eventRunners.forEach(r => { runnerSpentMap[r] = 0; });
+
+      const booths = Object.values(currentEv.booths || {});
+      booths.forEach(b => {
+        const items = Object.values(b.items || {});
+        const isBoothDone = items.length > 0 && items.every(it => {
+          const totalReq = state.members.reduce((s, m) => s + ((it.orders && it.orders[m] && it.orders[m].req) || 0), 0);
+          const totalBought = state.members.reduce((s, m) => s + ((it.orders && it.orders[m] && it.orders[m].bought) || 0), 0);
+          return it.status !== 'pending' || it.divisionCompleted || totalBought >= totalReq;
+        });
+        if (isBoothDone) doneBoothsCount++;
+
+        items.forEach(it => {
+          const totalReq = state.members.reduce((s, m) => s + ((it.orders && it.orders[m] && it.orders[m].req) || 0), 0);
+          const totalBought = state.members.reduce((s, m) => s + ((it.orders && it.orders[m] && it.orders[m].bought) || 0), 0);
+          const isDivisionItem = totalBought > 0 && totalBought < totalReq;
+
+          if (it.purchasedBy) {
+            Object.entries(it.purchasedBy).forEach(([rName, cnt]) => {
+              if (runnerSpentMap[rName] !== undefined) runnerSpentMap[rName] += cnt * it.price;
+            });
+          }
+
+          state.members.forEach(m => {
+            const ord = (it.orders && it.orders[m]) || { req: 0, bought: 0 };
+            planTotal += ord.req * it.price;
+            boughtTotal += ord.bought * it.price;
+            if (it.status === 'pending' && !isDivisionItem) {
+              pendingTotal += Math.max(0, (ord.req - ord.bought) * it.price);
+            }
+          });
+        });
+      });
+
+      const divisionItems = [];
+      booths.forEach(b => {
+        Object.values(b.items || {}).forEach(it => {
+          const totalReq = state.members.reduce((s, m) => s + ((it.orders && it.orders[m] && it.orders[m].req) || 0), 0);
+          const totalBought = state.members.reduce((s, m) => s + ((it.orders && it.orders[m] && it.orders[m].bought) || 0), 0);
+          if (totalBought > 0 && totalBought < totalReq) {
+            divisionItems.push({
+              boothId: b.id, itemId: it.id, boothCode: b.code, circle: b.circle,
+              itemName: it.name, price: it.price, totalReq, totalBought,
+              itemImage: it.itemImage, divisionCompleted: !!it.divisionCompleted
+            });
+          }
+        });
+      });
+
+      const pendingDivision = divisionItems.filter(i => !i.divisionCompleted);
+      const completedDivision = divisionItems.filter(i => i.divisionCompleted);
+
+      let html = `
+        <div class="flex gap-2 overflow-x-auto no-scrollbar py-1 mb-3">
+          ${evList.map(ev => `
+            <button onclick="selectSettleEvent('${ev.id}')" class="px-3.5 py-1.5 rounded-full text-sm font-medium whitespace-nowrap transition shrink-0 ${ev.id === state.settleEventId ? 'bg-[#4A7C6F] text-white shadow-sm' : 'bg-white text-gray-600'}">
+              ${ev.name} ${ev.date ? `(${ev.date})` : ''}
+            </button>
+          `).join('')}
+        </div>
+
+        <div class="card p-4 mb-4">
+          <div class="text-sm font-bold text-gray-700 mb-3">金額記錄 · ${currentEv.name}</div>
+          <div class="grid grid-cols-2 gap-2.5 mb-3">
+            <div class="bg-[#F4F5F0] p-3 rounded-xl">
+              <div class="text-xs text-gray-500">原計劃預算</div>
+              <div class="text-lg font-bold text-gray-800 mt-1">${formatCurrency(planTotal, currentEv.id)}</div>
+            </div>
+            <div class="bg-[#F4F5F0] p-3 rounded-xl">
+              <div class="text-xs text-gray-500">還要買 (待購)</div>
+              <div class="text-lg font-bold text-[#D96B43] mt-1">${formatCurrency(pendingTotal, currentEv.id)}</div>
+            </div>
+            <div class="bg-[#4A7C6F]/10 p-3 rounded-xl">
+              <div class="text-xs text-[#4A7C6F] font-medium">已購買總額</div>
+              <div class="text-xl font-bold text-[#4A7C6F] mt-1">${formatCurrency(boughtTotal, currentEv.id)}</div>
+            </div>
+            <div class="bg-[#4A7C6F]/10 p-3 rounded-xl">
+              <div class="text-xs text-[#4A7C6F] font-medium">完成攤位</div>
+              <div class="text-xl font-bold text-[#4A7C6F] mt-1">${doneBoothsCount} / ${booths.length} 攤</div>
+            </div>
+          </div>
+
+          <div class="pt-3 border-t border-gray-100">
+            <div class="text-xs font-bold text-gray-600 mb-2"><i class="fa-solid fa-person-walking mr-1 text-[#4A7C6F]"></i>各跑攤人成功購買金額：</div>
+            <div class="flex flex-wrap gap-2">
+              ${eventRunners.length === 0 ? '<div class="text-xs text-gray-400">尚未新增跑攤人</div>' : eventRunners.map(r => `
+                <div class="bg-[#F9FAF8] px-3 py-1.5 rounded-xl border border-gray-200 text-xs flex items-center gap-2">
+                  <span class="font-bold text-gray-700">${r}</span>
+                  <span class="font-bold text-[#4A7C6F]">${formatCurrency(runnerSpentMap[r] || 0, currentEv.id)}</span>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        </div>
+
+        <div class="card p-4 mb-4 border-2 border-[#4A7C6F]/20">
+          <div class="flex justify-between items-center mb-3">
+            <h3 class="font-bold text-base text-gray-800"><i class="fa-solid fa-pie-chart text-[#4A7C6F] mr-1.5"></i>商品瓜分 (買不齊分配)</h3>
+            <div class="flex bg-gray-100 p-1 rounded-xl text-xs">
+              <button onclick="setDivisionSubTab('pending')" class="relative px-3 py-1.5 rounded-lg font-bold transition ${state.settleDivisionSubTab === 'pending' ? 'bg-[#4A7C6F] text-white shadow-sm' : 'text-gray-600'}">
+                未完成瓜分
+                ${pendingDivision.length > 0 ? `<span class="absolute -top-1 -right-1 w-2.5 h-2.5 bg-red-500 rounded-full ring-2 ring-white"></span>` : ''}
+              </button>
+              <button onclick="setDivisionSubTab('completed')" class="px-3 py-1.5 rounded-lg font-bold transition ${state.settleDivisionSubTab === 'completed' ? 'bg-[#4A7C6F] text-white shadow-sm' : 'text-gray-600'}">
+                已完成瓜分 (${completedDivision.length})
+              </button>
+            </div>
+          </div>
+
+          ${state.settleDivisionSubTab === 'pending' ? `
+            <div class="space-y-3">
+              ${pendingDivision.length === 0 ? '<div class="text-center text-xs text-gray-400 py-6">目前沒有買不齊且需要瓜分的商品</div>' : pendingDivision.map(item => {
+                const itObj = state.events[state.settleEventId].booths[item.boothId].items[item.itemId];
+                const validMembersForDivision = state.members.filter(m => ((itObj.orders && itObj.orders[m] && itObj.orders[m].req) || 0) > 0);
+                if (!state.divisionEdits[item.itemId]) {
+                  state.divisionEdits[item.itemId] = {};
+                  validMembersForDivision.forEach(m => {
+                    state.divisionEdits[item.itemId][m] = (itObj.orders && itObj.orders[m] && itObj.orders[m].bought) || 0;
+                  });
+                }
+                const tempEdits = state.divisionEdits[item.itemId];
+                const currentSumTemp = validMembersForDivision.reduce((s, m) => s + (tempEdits[m] || 0), 0);
+                const isMatch = currentSumTemp === item.totalBought;
+                return `
+                  <div class="bg-[#F9FAF8] p-3.5 rounded-xl border border-gray-200 space-y-2.5">
+                    <div class="flex justify-between items-center">
+                      <div class="flex items-center gap-2.5">
+                        ${item.itemImage ? `<img src="${getImageSrc(item.itemImage)}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : ''}
+                        <div>
+                          <div class="text-xs font-bold text-[#4A7C6F]">${item.boothCode} ${item.circle}</div>
+                          <div class="text-sm font-medium text-gray-800">${item.itemName} (${formatCurrency(item.price, currentEv.id)})</div>
+                        </div>
+                      </div>
+                      <div class="text-xs font-bold text-[#D96B43] bg-amber-50 px-2 py-1 rounded-lg border border-amber-200">
+                        實際買到: ${item.totalBought} / 需求: ${item.totalReq}
+                      </div>
+                    </div>
+                    <div class="bg-white p-3 rounded-xl border space-y-2">
+                      <div class="text-[11px] font-bold text-gray-600">分配誰獲得這 ${item.totalBought} 件商品：</div>
+                      <div class="space-y-1.5">
+                        ${validMembersForDivision.map(m => {
+                          const val = tempEdits[m] || 0;
+                          return `
+                            <div class="flex justify-between items-center text-xs">
+                              <span class="font-medium text-gray-700">${m} <span class="text-gray-400">(需求 ${itObj.orders[m].req})</span></span>
+                              <div class="flex items-center gap-2 bg-gray-50 px-2 py-1 rounded-lg border">
+                                <button onclick="updateDivisionTempBought('${item.boothId}', '${item.itemId}', '${m}', -1)" class="w-6 h-6 rounded bg-white font-bold text-gray-600 shadow-sm border">-</button>
+                                <span class="font-bold w-8 text-center text-[#4A7C6F]">${val}</span>
+                                <button onclick="updateDivisionTempBought('${item.boothId}', '${item.itemId}', '${m}', 1)" class="w-6 h-6 rounded bg-[#4A7C6F]/15 font-bold text-[#4A7C6F]">+</button>
+                              </div>
+                            </div>
+                          `;
+                        }).join('')}
+                      </div>
+                      <div class="flex justify-between items-center pt-2.5 border-t text-xs">
+                        <span class="${isMatch ? 'text-emerald-600 font-bold' : 'text-amber-600 font-bold'}">
+                          分配總數: ${currentSumTemp} / ${item.totalBought} ${isMatch ? '✓' : '(需相符)'}
+                        </span>
+                        <button onclick="completeDivision('${item.boothId}', '${item.itemId}')" class="btn-primary px-3.5 py-1.5 rounded-xl text-xs font-bold shadow-sm">完成瓜分</button>
+                      </div>
+                    </div>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          ` : `
+            <div class="space-y-3">
+              ${completedDivision.length === 0 ? '<div class="text-center text-xs text-gray-400 py-6">目前沒有已完成瓜分的商品</div>' : completedDivision.map(item => {
+                const itObj = state.events[state.settleEventId].booths[item.boothId].items[item.itemId];
+                return `
+                  <div class="bg-[#F9FAF8] p-3.5 rounded-xl border border-gray-200 flex justify-between items-center">
+                    <div class="flex items-center gap-2.5">
+                      ${item.itemImage ? `<img src="${getImageSrc(item.itemImage)}" class="w-11 h-11 object-cover rounded-lg border shrink-0" />` : ''}
+                      <div>
+                        <div class="text-xs font-bold text-[#4A7C6F]">${item.boothCode} ${item.circle}</div>
+                        <div class="text-sm font-medium text-gray-800">${item.itemName}</div>
+                        <div class="text-xs text-gray-500 mt-0.5 font-medium">
+                          分配結果：${state.members.map(m => {
+                            const b = (itObj.orders && itObj.orders[m] && itObj.orders[m].bought) || 0;
+                            return b > 0 ? `${m}獲得${b}本` : '';
+                          }).filter(Boolean).join('、') || '無分配'}
+                        </div>
+                      </div>
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0">
+                      <span class="text-[11px] px-2 py-1 rounded-lg bg-emerald-100 text-emerald-700 font-bold">已瓜分</span>
+                      <button onclick="editDivision('${item.boothId}', '${item.itemId}')" class="px-3 py-1.5 rounded-lg bg-gray-200 text-gray-700 text-xs font-bold hover:bg-gray-300">編輯</button>
+                    </div>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          `}
+        </div>
+
+        <div class="text-sm font-bold text-gray-700 mb-2 px-1">按人分開算 · 點擊成員查看希望商品、通販待購與 差し入れ 明細</div>
+        <div class="space-y-3">
+          ${state.members.map(m => {
+            let mBoughtCost = 0, mPlanCost = 0;
+            booths.forEach(b => {
+              Object.values(b.items || {}).forEach(it => {
+                const ord = (it.orders && it.orders[m]) || { req: 0, bought: 0 };
+                mPlanCost += ord.req * it.price;
+                mBoughtCost += ord.bought * it.price;
+              });
+            });
+            return `
+              <div class="card p-4 cursor-pointer hover:bg-gray-50 transition" onclick="openMemberDetailModal('${m}', '${currentEv.id}')">
+                <div class="flex justify-between items-center">
+                  <div class="flex items-center gap-2">
+                    <span class="w-7 h-7 rounded-full bg-[#4A7C6F] text-white text-xs font-bold flex items-center justify-center">${m[0]}</span>
+                    <span class="font-bold text-base text-gray-800">${m}</span>
+                    <span class="text-xs text-[#4A7C6F] bg-[#4A7C6F]/10 px-2 py-0.5 rounded ml-2">查看明細 <i class="fa-solid fa-chevron-right text-[10px]"></i></span>
+                  </div>
+                  <div class="flex gap-4 text-right">
+                    <div>
+                      <div class="text-[10px] text-gray-400">預算</div>
+                      <div class="text-sm font-bold text-gray-600">${formatCurrency(mPlanCost, currentEv.id)}</div>
+                    </div>
+                    <div>
+                      <div class="text-[10px] text-gray-400">實買應付</div>
+                      <div class="text-base font-bold text-[#D96B43]">${formatCurrency(mBoughtCost, currentEv.id)}</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      `;
+      container.innerHTML = html;
+    }
+
+    function setDivisionSubTab(subTab) { state.settleDivisionSubTab = subTab; render(); }
+
+    function updateDivisionTempBought(boothId, itemId, member, delta) {
+      if (!state.divisionEdits[itemId]) {
+        state.divisionEdits[itemId] = {};
+        const item = state.events[state.settleEventId].booths[boothId].items[itemId];
+        state.members.forEach(m => {
+          state.divisionEdits[itemId][m] = (item.orders && item.orders[m] && item.orders[m].bought) || 0;
+        });
+      }
+      const currentVal = state.divisionEdits[itemId][member] || 0;
+      state.divisionEdits[itemId][member] = Math.max(0, currentVal + delta);
+      render();
+    }
+
+    function completeDivision(boothId, itemId) {
+      const item = state.events[state.settleEventId].booths[boothId].items[itemId];
+      const totalBought = state.members.reduce((s, m) => s + ((item.orders && item.orders[m] && item.orders[m].bought) || 0), 0);
+      const tempEdits = state.divisionEdits[itemId];
+      const validMembers = Object.keys(tempEdits || {});
+      const tempSum = validMembers.reduce((s, m) => s + (tempEdits[m] || 0), 0);
+
+      if (tempSum !== totalBought) {
+        alert(`分配總數 (${tempSum}) 與實際買到總數 (${totalBought}) 不符，請調整各成員分配數至相符後再點擊完成瓜分！`);
+        return;
+      }
+
+      validMembers.forEach(m => {
+        if (!item.orders[m]) item.orders[m] = { req: 0, bought: 0 };
+        item.orders[m].bought = tempEdits[m] || 0;
+      });
+
+      item.divisionCompleted = true;
+      delete state.divisionEdits[itemId];
+      saveData(); render();
+    }
+
+    function editDivision(boothId, itemId) {
+      const item = state.events[state.settleEventId].booths[boothId].items[itemId];
+      item.divisionCompleted = false;
+      state.divisionEdits[itemId] = {};
+      state.members.forEach(m => {
+        state.divisionEdits[itemId][m] = (item.orders && item.orders[m] && item.orders[m].bought) || 0;
+      });
+      state.settleDivisionSubTab = 'pending';
+      saveData();
+    }
+
+    function selectSettleEvent(evId) { state.settleEventId = evId; render(); }
+
+    function openMemberDetailModal(memberName, evId) {
+      currentOpenMemberModal = { memberName, evId };
+      const ev = state.events[evId];
+      if (!ev) return;
+      const isEditing = !!state.editingMemberDetails[memberName];
+      const eventRunners = (state.runnersByEvent && state.runnersByEvent[evId]) || [];
+
+      const memberItems = [], pendingOrMissedItems = [], sashiireList = [];
+      let totalPlan = 0, totalBought = 0;
+      const memberOweRunnerMap = {};
+      eventRunners.forEach(r => { memberOweRunnerMap[r] = 0; });
+
+      Object.values(ev.booths || {}).forEach(b => {
+        const authors = getBoothAuthors(b);
+        authors.forEach((auth, aIdx) => {
+          if ((auth.sashiire || []).includes(memberName)) {
+            const given = !!(auth.sashiireGiven && auth.sashiireGiven[memberName]);
+            sashiireList.push({
+              boothId: b.id, authorIdx: aIdx, authorName: auth.name || '未命名作者',
+              boothCode: b.code, circle: b.circle, given
+            });
+          }
+        });
+
+        Object.values(b.items || {}).forEach(it => {
+          const ord = it.orders && it.orders[memberName];
+          if (ord && (ord.req > 0 || ord.bought > 0)) {
+            totalPlan += ord.req * it.price;
+            totalBought += ord.bought * it.price;
+            memberItems.push({
+              boothId: b.id, itemId: it.id, boothCode: b.code, circle: b.circle,
+              itemName: it.name, price: it.price, req: ord.req, bought: ord.bought, status: it.status, itemImage: it.itemImage
+            });
+            if (it.status !== 'skip' && ord.bought < ord.req) {
+              pendingOrMissedItems.push({
+                boothId: b.id, itemId: it.id, boothCode: b.code, circle: b.circle,
+                itemName: it.name, price: it.price, req: ord.req, bought: ord.bought,
+                tsuhanBought: ord.tsuhanBought || 0, status: it.status, itemImage: it.itemImage
+              });
+            }
+            if (ord.bought > 0) {
+              const pBy = it.purchasedBy || {};
+              const totalRunnerBought = Object.values(pBy).reduce((s, c) => s + c, 0);
+              if (totalRunnerBought > 0) {
+                Object.entries(pBy).forEach(([rName, rCnt]) => {
+                  if (memberOweRunnerMap[rName] !== undefined) {
+                    memberOweRunnerMap[rName] += (rCnt / totalRunnerBought) * (ord.bought * it.price);
+                  }
+                });
+              } else if (eventRunners.length > 0) {
+                const share = (ord.bought * it.price) / eventRunners.length;
+                eventRunners.forEach(r => { memberOweRunnerMap[r] += share; });
+              }
+            }
+          }
+        });
+      });
+
+      sashiireList.sort((a, b) => (a.given === b.given ? 0 : a.given ? 1 : -1));
+
+      showModal(`
+        <div class="flex justify-between items-center mb-3 pb-2 border-b">
+          <div>
+            <h3 class="font-bold text-base text-gray-800">${memberName} · ${ev.name}</h3>
+            <p class="text-xs text-gray-400">希望商品、通販待購與 差し入れ 明細</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <button onclick="toggleMemberDetailEdit('${memberName}')" class="px-2.5 py-1 rounded bg-[#4A7C6F]/15 text-[#4A7C6F] text-xs font-bold">${isEditing ? '完成編輯' : '編輯'}</button>
+            <button onclick="closeMemberDetailModal()" class="text-gray-400 text-lg">&times;</button>
+          </div>
+        </div>
+        <div class="space-y-2 mb-3 bg-gray-50 p-3 rounded-xl text-xs">
+          <div class="flex justify-between items-center">
+            <div>預算: <span class="font-bold text-gray-700">${formatCurrency(totalPlan, evId)}</span> | 應付: <span class="font-bold text-[#D96B43]">${formatCurrency(totalBought, evId)}</span></div>
+            <div class="flex gap-1 bg-white p-0.5 rounded border">
+              <button onclick="setSettleImageMode('small')" class="px-2 py-0.5 rounded text-[10px] ${state.settleImageMode === 'small' ? 'bg-[#4A7C6F] text-white font-bold' : 'text-gray-600'}">小圖</button>
+              <button onclick="setSettleImageMode('medium')" class="px-2 py-0.5 rounded text-[10px] ${state.settleImageMode === 'medium' ? 'bg-[#4A7C6F] text-white font-bold' : 'text-gray-600'}">中圖</button>
+              <button onclick="setSettleImageMode('large')" class="px-2 py-0.5 rounded text-[10px] ${state.settleImageMode === 'large' ? 'bg-[#4A7C6F] text-white font-bold' : 'text-gray-600'}">大圖</button>
+            </div>
+          </div>
+          <div class="pt-2 border-t border-gray-200">
+            <div class="font-bold text-gray-700 mb-1"><i class="fa-solid fa-coins mr-1 text-[#4A7C6F]"></i>需給回各跑攤人的金額：</div>
+            <div class="flex flex-wrap gap-2">
+              ${eventRunners.length === 0 ? '<span class="text-gray-400">尚無跑攤人資料</span>' : eventRunners.map(r => `
+                <span class="bg-white px-2 py-1 rounded border border-gray-200 font-bold text-gray-800">${r}: <span class="text-[#D96B43]">${formatCurrency(Math.round(memberOweRunnerMap[r] || 0), evId)}</span></span>
+              `).join('')}
+            </div>
+          </div>
+        </div>
+        <div class="space-y-4 max-h-[60vh] overflow-y-auto pr-1">
+          <details class="bg-indigo-50/70 rounded-xl border border-indigo-200 overflow-hidden" open>
+            <summary class="p-3 text-xs font-bold text-indigo-900 cursor-pointer select-none flex justify-between items-center bg-indigo-100/60">
+              <span><i class="fa-solid fa-bag-shopping mr-1"></i>待通販或下次場販商品列表 (${pendingOrMissedItems.length})</span>
+              <i class="fa-solid fa-chevron-down text-[10px]"></i>
+            </summary>
+            <div class="p-3 space-y-2 bg-white">
+              ${pendingOrMissedItems.length === 0 ? '<div class="text-xs text-gray-400 text-center py-2">太棒了！所有商品皆已順利買齊！</div>' : pendingOrMissedItems.map(item => `
+                <div class="bg-gray-50 p-2.5 rounded-lg border space-y-1">
+                  <div class="flex justify-between items-center">
+                    <div class="text-xs font-bold text-[#4A7C6F]">${item.boothCode} ${item.circle}</div>
+                    <span class="text-[10px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded font-bold">${item.status === 'soldout' ? '場販售空' : '未買齊'}</span>
+                  </div>
+                  <div class="text-xs font-medium text-gray-800">${item.itemName} (需求 ${item.req} / 已買 ${item.bought})</div>
+                  <div class="flex justify-between items-center pt-1 text-xs">
+                    <span class="text-gray-500">在通販買到數量：</span>
+                    <div class="flex items-center gap-1.5 bg-white px-2 py-1 rounded border">
+                      <button onclick="updateTsuhanQty('${evId}', '${item.boothId}', '${item.itemId}', '${memberName}', -1)" class="w-5 h-5 rounded bg-gray-100 font-bold text-xs">-</button>
+                      <span class="font-bold w-6 text-center text-[#4A7C6F]">${item.tsuhanBought}</span>
+                      <button onclick="updateTsuhanQty('${evId}', '${item.boothId}', '${item.itemId}', '${memberName}', 1)" class="w-5 h-5 rounded bg-[#4A7C6F]/15 font-bold text-xs text-[#4A7C6F]">+</button>
+                    </div>
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+          </details>
+          ${sashiireList.length > 0 ? `
+            <details class="bg-amber-50/70 rounded-xl border border-amber-200 overflow-hidden" open>
+              <summary class="p-3 text-xs font-bold text-amber-900 cursor-pointer select-none flex justify-between items-center bg-amber-100/60">
+                <span><i class="fa-solid fa-gift mr-1"></i>${memberName} 的 差し入れ 清單 (${sashiireList.filter(s => s.given).length}/${sashiireList.length} 已給)</span>
+                <i class="fa-solid fa-chevron-down text-[10px]"></i>
+              </summary>
+              <div class="p-3 space-y-1.5 bg-white">
+                ${sashiireList.map(s => `
+                  <div class="flex justify-between items-center px-3 py-2 rounded-lg border transition ${s.given ? 'bg-gray-100 border-gray-200 opacity-50 grayscale' : 'bg-white border-amber-200 shadow-sm'}">
+                    <div class="flex items-center gap-2">
+                      ${isEditing ? `<input type="checkbox" ${s.given ? 'checked' : ''} onchange="toggleMemberDetailSashiire('${evId}', '${s.boothId}', ${s.authorIdx}, '${memberName}', this.checked)" class="w-4 h-4 accent-[#4A7C6F]" />` : ''}
+                      <div>
+                        <span class="font-bold text-xs text-gray-800 ${s.given ? 'line-through' : ''}">${s.authorName}</span>
+                        <span class="text-[11px] text-[#4A7C6F] font-bold ml-1.5">(${s.boothCode})</span>
+                      </div>
+                    </div>
+                    <span class="text-[10px] font-bold px-2 py-0.5 rounded ${s.given ? 'bg-gray-200 text-gray-500' : 'bg-amber-100 text-amber-800'}">${s.given ? '已給' : '還沒給'}</span>
+                  </div>
+                `).join('')}
+              </div>
+            </details>
+          ` : ''}
+          <div class="space-y-2.5">
+            ${memberItems.length === 0 ? '<div class="text-center text-xs text-gray-400 py-6">此成員在此活動中無登記任何商品</div>' : memberItems.map(item => {
+              const imgClass = state.settleImageMode === 'small' ? 'w-10 h-10' : state.settleImageMode === 'large' ? 'w-24 h-24' : 'w-16 h-16';
+              return `
+                <div class="bg-[#F9FAF8] p-3 rounded-xl border border-gray-100 flex items-center justify-between">
+                  <div class="flex items-center gap-2.5">
+                    ${item.itemImage ? `<img src="${getImageSrc(item.itemImage)}" class="${imgClass} object-cover rounded border shrink-0 transition-all" />` : `<div class="${imgClass} bg-gray-200 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>`}
+                    <div>
+                      <div class="text-xs font-bold text-[#4A7C6F]">${item.boothCode} ${item.circle}</div>
+                      <div class="text-sm font-medium text-gray-800">${item.itemName}</div>
+                      <div class="text-xs text-gray-500 mt-0.5">
+                        單價 ${formatCurrency(item.price, evId)} · 
+                        ${isEditing ? `需求 <input type="number" min="0" value="${item.req}" onchange="updateMemberReqLive('${evId}', '${item.boothId}', '${item.itemId}', '${memberName}', this.value)" class="w-14 border rounded px-1 py-0.5 text-center font-bold text-xs" /> 本` : `需求 <span class="font-bold text-gray-800">${item.req}</span> 本`}
+                        / 已買 <span class="font-bold text-[#4A7C6F]">${item.bought}</span> 本
+                      </div>
+                    </div>
+                  </div>
+                  <div class="text-right shrink-0">
+                    <div class="text-xs font-bold text-[#D96B43]">${formatCurrency(item.bought * item.price, evId)}</div>
+                    <div class="text-[10px] text-gray-400">${item.status === 'done' ? '已買齊' : item.status === 'soldout' ? '售空' : item.status === 'skip' ? '已放棄' : '待購'}</div>
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        </div>
+      `);
+    }
+
+    function updateTsuhanQty(evId, boothId, itemId, memberName, delta) {
+      const ev = state.events[evId];
+      if (!ev || !ev.booths[boothId] || !ev.booths[boothId].items[itemId]) return;
+      const it = ev.booths[boothId].items[itemId];
+      if (!it.orders[memberName]) it.orders[memberName] = { req: 0, bought: 0, tsuhanBought: 0 };
+      it.orders[memberName].tsuhanBought = Math.max(0, (it.orders[memberName].tsuhanBought || 0) + delta);
+      saveData(); openMemberDetailModal(memberName, evId);
+    }
+
+    function toggleMemberDetailSashiire(evId, boothId, authorIdx, memberName, isChecked) {
+      const ev = state.events[evId];
+      if (!ev || !ev.booths[boothId]) return;
+      const authors = getBoothAuthors(ev.booths[boothId]);
+      if (authors[authorIdx]) {
+        if (!authors[authorIdx].sashiireGiven) authors[authorIdx].sashiireGiven = {};
+        authors[authorIdx].sashiireGiven[memberName] = isChecked;
+        ev.booths[boothId].authors = authors;
+        saveData(); openMemberDetailModal(memberName, evId);
+      }
+    }
+
+    function closeMemberDetailModal() { currentOpenMemberModal = null; closeModal(); }
+    function toggleMemberDetailEdit(memberName) {
+      state.editingMemberDetails[memberName] = !state.editingMemberDetails[memberName];
+      if (currentOpenMemberModal) openMemberDetailModal(memberName, currentOpenMemberModal.evId);
+    }
+    function updateMemberReqLive(evId, boothId, itemId, memberName, val) {
+      const req = parseInt(val) || 0;
+      const ev = state.events[evId];
+      if (ev && ev.booths[boothId] && ev.booths[boothId].items[itemId]) {
+        const item = ev.booths[boothId].items[itemId];
+        if (!item.orders[memberName]) item.orders[memberName] = { req: 0, bought: 0 };
+        item.orders[memberName].req = req;
+        saveData();
+      }
+    }
+    function setSettleImageMode(mode) {
+      state.settleImageMode = mode;
+      saveData();
+      if (currentOpenMemberModal) openMemberDetailModal(currentOpenMemberModal.memberName, currentOpenMemberModal.evId);
+      else render();
+    }
+
+    // ------------------------------------------
+    // 分頁 4：「商品．作者與成員庫」
+    // ------------------------------------------
+    function renderFavoritesTab(container) {
+      const subTab = state.librarySubTab || 'items';
+      const filterEv = state.libraryFilterEvent || 'all';
+      const filterTag = state.libraryFilterTag || 'all';
+      const evList = getSortedEvents();
+      const allTags = getTopTags();
+
+      container.innerHTML = `
+        <div class="card p-4 mb-3">
+          <div class="flex justify-between items-center mb-3">
+            <div>
+              <div class="font-bold text-base">商品、作者與成員庫</div>
+              <div class="text-xs text-gray-400">整合所有活動的商品、作者與成員資訊，支援搜尋、篩選與加入活動</div>
+            </div>
+            <button onclick="openNewFavModal()" class="btn-primary px-3 py-1.5 rounded-xl text-xs font-bold shrink-0">+ 收藏作者</button>
+          </div>
+          <div class="flex bg-gray-100 p-1 rounded-xl text-xs mb-3">
+            <button onclick="setLibrarySubTab('items')" class="flex-1 py-1.5 rounded-lg font-bold transition ${subTab === 'items' ? 'bg-[#4A7C6F] text-white shadow-sm' : 'text-gray-600'}">商品庫</button>
+            <button onclick="setLibrarySubTab('authors')" class="flex-1 py-1.5 rounded-lg font-bold transition ${subTab === 'authors' ? 'bg-[#4A7C6F] text-white shadow-sm' : 'text-gray-600'}">作者庫</button>
+            <button onclick="setLibrarySubTab('members')" class="flex-1 py-1.5 rounded-lg font-bold transition ${subTab === 'members' ? 'bg-[#4A7C6F] text-white shadow-sm' : 'text-gray-600'}">成員庫</button>
+          </div>
+          <div class="space-y-2">
+            <div class="relative">
+              <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-gray-400 text-xs"></i>
+              <input id="library-search-input" type="text" value="${state.librarySearch || ''}" oninput="setLibrarySearch(this.value)" placeholder="${subTab === 'items' ? '搜尋商品或創作者名稱...' : subTab === 'authors' ? '搜尋作者或社團名稱...' : '搜尋成員名稱...'}" class="w-full border rounded-xl pl-8 pr-3 py-1.5 text-xs bg-gray-50" />
+            </div>
+            ${subTab !== 'members' ? `
+              <div class="flex gap-2 overflow-x-auto no-scrollbar py-1 text-xs items-center">
+                <select onchange="setLibraryFilterEvent(this.value)" class="border rounded-lg px-2 py-1 bg-white text-gray-700 font-bold shrink-0">
+                  <option value="all" ${filterEv === 'all' ? 'selected' : ''}>所有活動</option>
+                  ${evList.map(ev => `<option value="${ev.id}" ${filterEv === ev.id ? 'selected' : ''}>${ev.name}</option>`).join('')}
+                </select>
+                ${subTab === 'items' ? `
+                  <select onchange="setLibraryFilterTag(this.value)" class="border rounded-lg px-2 py-1 bg-white text-gray-700 font-bold shrink-0">
+                    <option value="all" ${filterTag === 'all' ? 'selected' : ''}>所有標籤</option>
+                    ${allTags.map(t => `<option value="${t}" ${filterTag === t ? 'selected' : ''}>#${t}</option>`).join('')}
+                  </select>
+                ` : ''}
+              </div>
+            ` : ''}
+          </div>
+        </div>
+        <div id="library-results-container"></div>
+      `;
+      renderLibraryResultsOnly();
+    }
+
+    function renderLibraryResultsOnly() {
+      const resultsEl = document.getElementById('library-results-container');
+      if (!resultsEl) return;
+      const subTab = state.librarySubTab || 'items';
+      const search = (state.librarySearch || '').trim().toLowerCase();
+      const filterEv = state.libraryFilterEvent || 'all';
+      const filterTag = state.libraryFilterTag || 'all';
+      let html = '';
+
+      if (subTab === 'items') {
+        let allItemsList = [];
+        Object.values(state.events || {}).forEach(ev => {
+          if (filterEv !== 'all' && ev.id !== filterEv) return;
+          Object.values(ev.booths || {}).forEach(b => {
+            Object.values(b.items || {}).forEach(it => {
+              const tags = Array.isArray(it.tags) ? it.tags : [];
+              if (filterTag !== 'all' && !tags.includes(filterTag)) return;
+              const itemName = (it.name || '').toLowerCase();
+              const authorsStr = getItemAuthors(it).join(' ').toLowerCase();
+              if (search && !itemName.includes(search) && !authorsStr.includes(search)) return;
+              const memberGetSummary = [];
+              state.members.forEach(m => {
+                const bgt = (it.orders && it.orders[m] && it.orders[m].bought) || 0;
+                if (bgt > 0) memberGetSummary.push(`${m}×${bgt}`);
+              });
+              allItemsList.push({
+                evId: ev.id, evName: ev.name, boothId: b.id, boothCode: b.code, circle: b.circle,
+                item: it, authors: getItemAuthors(it), memberGetSummary
+              });
+            });
+          });
+        });
+
+        html += `<div class="space-y-3">`;
+        if (allItemsList.length === 0) {
+          html += `<div class="card p-8 text-center text-gray-400 text-xs">沒有找到符合條件的商品</div>`;
+        } else {
+          allItemsList.forEach(entry => {
+            const it = entry.item;
+            html += `
+              <div class="card p-3.5 space-y-2 border border-gray-100">
+                <div class="flex justify-between items-start">
+                  <div class="flex items-center gap-2.5">
+                    ${it.itemImage ? `<img src="${getImageSrc(it.itemImage)}" loading="lazy" class="w-12 h-12 object-cover rounded-lg border shrink-0" />` : '<div class="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>'}
+                    <div>
+                      <div class="text-xs font-bold text-[#4A7C6F]">${entry.evName} · ${entry.boothCode} ${entry.circle}</div>
+                      <div class="text-sm font-medium text-gray-800">${it.name}</div>
+                      <div class="text-xs text-[#D96B43] font-bold mt-0.5">${formatCurrency(it.price, entry.evId)}</div>
+                    </div>
+                  </div>
+                  <button onclick="openAddToEventModal('item', '${entry.evId}', '${entry.boothId}', '${it.id}')" class="btn-primary px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 shadow-sm">+ 加入活動</button>
+                </div>
+                <div class="flex justify-between items-center text-[11px] text-gray-500 pt-1 border-t border-gray-100">
+                  <span>創作者: ${entry.authors.join('、') || '無'}</span>
+                  <span>得獎/購買: ${entry.memberGetSummary.join('、') || '尚無'}</span>
+                </div>
+              </div>
+            `;
+          });
+        }
+        html += `</div>`;
+      } else if (subTab === 'authors') {
+        let authorMap = {};
+        Object.values(state.events || {}).forEach(ev => {
+          if (filterEv !== 'all' && ev.id !== filterEv) return;
+          Object.values(ev.booths || {}).forEach(b => {
+            getBoothAuthors(b).forEach(a => {
+              if (!a.name) return;
+              if (search && !a.name.toLowerCase().includes(search) && !(b.circle || '').toLowerCase().includes(search)) return;
+              if (!authorMap[a.name]) authorMap[a.name] = { name: a.name, links: a.links || [], events: new Set(), items: [] };
+              authorMap[a.name].events.add(ev.name);
+              Object.values(b.items || {}).forEach(it => {
+                const itsAuth = getItemAuthors(it);
+                if (itsAuth.length === 0 || itsAuth.includes(a.name)) {
+                  authorMap[a.name].items.push({ name: it.name, price: it.price, evName: ev.name, circle: b.circle });
+                }
+              });
+            });
+          });
+        });
+        (state.favorites || []).forEach(f => {
+          if (!f.author) return;
+          if (search && !f.author.toLowerCase().includes(search) && !(f.circle || '').toLowerCase().includes(search)) return;
+          if (!authorMap[f.author]) authorMap[f.author] = { name: f.author, links: f.link ? [f.link] : [], events: new Set(['常用收藏']), items: [] };
+        });
+        const authorsList = Object.values(authorMap);
+        html += `<div class="space-y-3">`;
+        if (authorsList.length === 0) {
+          html += `<div class="card p-8 text-center text-gray-400 text-xs">沒有找到符合條件的作者</div>`;
+        } else {
+          authorsList.forEach(auth => {
+            const evsArr = Array.from(auth.events);
+            html += `
+              <div class="card p-4 space-y-2.5 border border-gray-100">
+                <div class="flex justify-between items-start">
+                  <div>
+                    <div class="font-bold text-base text-gray-800">${auth.name}</div>
+                    <div class="text-xs text-gray-400 mt-0.5">出現活動：${evsArr.join('、')}</div>
+                  </div>
+                  <button onclick="openAddToEventModal('author', '', '', '', '${auth.name.replace(/'/g, "\'")}')" class="btn-primary px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 shadow-sm">+ 加入活動</button>
+                </div>
+                ${auth.items.length > 0 ? `
+                  <div class="bg-gray-50 p-2.5 rounded-xl border space-y-1">
+                    <div class="text-[11px] font-bold text-gray-600">出品商品紀錄：</div>
+                    <div class="space-y-1">
+                      ${auth.items.slice(0, 5).map(it => `
+                        <div class="flex justify-between text-xs bg-white px-2 py-1 rounded border">
+                          <span class="font-medium text-gray-800">${it.name}</span>
+                          <span class="text-[#D96B43] font-bold">¥${it.price} <span class="text-[10px] text-gray-400">(${it.evName})</span></span>
+                        </div>
+                      `).join('')}
+                      ${auth.items.length > 5 ? `<div class="text-[10px] text-gray-400 text-center">...等共 ${auth.items.length} 件商品</div>` : ''}
+                    </div>
+                  </div>
+                ` : ''}
+              </div>
+            `;
+          });
+        }
+        html += `</div>`;
+      } else if (subTab === 'members') {
+        const filteredMembers = state.members.filter(m => !search || m.toLowerCase().includes(search));
+        html += `<div class="space-y-3">`;
+        if (filteredMembers.length === 0) {
+          html += `<div class="card p-8 text-center text-gray-400 text-xs">沒有找到符合條件的成員</div>`;
+        } else {
+          filteredMembers.forEach(m => {
+            html += `
+              <div class="card p-4 flex justify-between items-center cursor-pointer hover:bg-gray-50 transition" onclick="openLibMemberDetailModal('${m}')">
+                <div class="flex items-center gap-2.5">
+                  <span class="w-8 h-8 rounded-full bg-[#4A7C6F] text-white text-xs font-bold flex items-center justify-center">${m[0]}</span>
+                  <div>
+                    <div class="font-bold text-base text-gray-800">${m}</div>
+                    <div class="text-xs text-gray-400 mt-0.5">點擊查看跨活動所有商品、通販待購與明細</div>
+                  </div>
+                </div>
+                <span class="text-xs text-[#4A7C6F] font-bold bg-[#4A7C6F]/10 px-3 py-1.5 rounded-xl">查看明細 <i class="fa-solid fa-chevron-right text-[10px]"></i></span>
+              </div>
+            `;
+          });
+        }
+        html += `</div>`;
+      }
+      resultsEl.innerHTML = html;
+    }
+
+    function setLibrarySubTab(tab) { state.librarySubTab = tab; state.librarySearch = ''; render(); }
+    function setLibrarySearch(val) { state.librarySearch = val; renderLibraryResultsOnly(); }
+    function setLibraryFilterEvent(val) { state.libraryFilterEvent = val; renderLibraryResultsOnly(); }
+    function setLibraryFilterTag(val) { state.libraryFilterTag = val; renderLibraryResultsOnly(); }
+
+    function openAddToEventModal(type, srcEvId, srcBoothId, srcItemId, authorName = '') {
+      const evList = getSortedEvents();
+      if (evList.length === 0) return alert('請先建立展會活動！');
+      let targetEvId = state.activeEventId || evList[0].id;
+      let targetBoothAction = 'existing';
+      let selectedBoothId = '';
+      let pastWorksForAuthor = [];
+
+      if (type === 'author') {
+        Object.values(state.events || {}).forEach(ev => {
+          Object.values(ev.booths || {}).forEach(b => {
+            const bAuths = getBoothAuthors(b).map(a => a.name);
+            Object.values(b.items || {}).forEach(it => {
+              if (bAuths.includes(authorName)) {
+                pastWorksForAuthor.push({ name: it.name, price: it.price, links: getItemLinks(it), tags: it.tags || [], itemImage: it.itemImage || '' });
+              }
+            });
+          });
+        });
+      }
+
+      window.renderAddToEventModalContent = () => {
+        const ev = state.events[targetEvId];
+        const booths = ev && ev.booths ? Object.values(ev.booths) : [];
+        showModal(`
+          <div class="flex justify-between items-center mb-3">
+            <h3 class="font-bold text-base text-gray-800"><i class="fa-solid fa-circle-plus text-[#4A7C6F] mr-1.5"></i>將${type === 'item' ? '商品' : '作者'}加入活動</h3>
+            <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+          </div>
+          <div class="space-y-3 max-h-[75vh] overflow-y-auto pr-1">
+            <div>
+              <label class="text-xs font-bold text-gray-700 block mb-1">1. 選擇目標活動：</label>
+              <select onchange="updateTargetEv(this.value)" class="w-full border rounded-xl px-3 py-2 text-sm bg-gray-50 font-bold">
+                ${evList.map(e => `<option value="${e.id}" ${e.id === targetEvId ? 'selected' : ''}>${e.name} (${e.hall || '主展館'})</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              <label class="text-xs font-bold text-gray-700 block mb-1">2. 選擇加入現有攤位或新增攤位：</label>
+              <div class="flex gap-2 mb-2">
+                <button type="button" onclick="setBoothAction('existing')" class="flex-1 py-1.5 rounded-lg text-xs font-bold border ${targetBoothAction === 'existing' ? 'bg-[#4A7C6F] text-white border-[#4A7C6F]' : 'bg-white text-gray-700'}">選擇現有攤位</button>
+                <button type="button" onclick="setBoothAction('new')" class="flex-1 py-1.5 rounded-lg text-xs font-bold border ${targetBoothAction === 'new' ? 'bg-[#4A7C6F] text-white border-[#4A7C6F]' : 'bg-white text-gray-700'}">新增新攤位</button>
+              </div>
+              ${targetBoothAction === 'existing' ? `
+                <div class="space-y-1.5">
+                  <input id="booth-quick-search" type="text" placeholder="搜尋攤位編號或社團名稱加速選擇..." oninput="filterBoothListInModal(this.value)" class="w-full border rounded-xl px-3 py-2 text-xs" />
+                  <div id="booth-select-container" class="space-y-1.5 max-h-40 overflow-y-auto border rounded-xl p-2 bg-gray-50">
+                    ${booths.length === 0 ? '<div class="text-xs text-gray-400 text-center py-2">此活動尚無攤位，請切換為新增攤位</div>' : booths.map(b => `
+                      <label class="flex items-center gap-2 p-2 rounded-lg bg-white border cursor-pointer hover:bg-emerald-50 booth-option-label" data-text="${(b.code + ' ' + b.circle).toLowerCase()}">
+                        <input type="radio" name="target_booth_radio" value="${b.id}" ${selectedBoothId === b.id || (!selectedBoothId && booths[0].id === b.id) ? 'checked' : ''} onchange="selectedBoothId='${b.id}'" class="accent-[#4A7C6F]" />
+                        <span class="font-bold text-xs">${b.code} - ${b.circle}</span>
+                      </label>
+                    `).join('')}
+                  </div>
+                </div>
+              ` : `
+                <div class="bg-gray-50 p-3 rounded-xl border space-y-2">
+                  <div class="grid grid-cols-2 gap-2">
+                    <div>
+                      <label class="text-[10px] text-gray-500">新攤位編號 *</label>
+                      <input id="new-added-booth-code" type="text" placeholder="例: A-12" class="w-full border rounded px-2.5 py-1.5 text-xs font-bold" />
+                    </div>
+                    <div>
+                      <label class="text-[10px] text-gray-500">社團名稱 *</label>
+                      <input id="new-added-booth-circle" type="text" placeholder="社團名" value="${type === 'author' ? authorName : ''}" class="w-full border rounded px-2.5 py-1.5 text-xs font-bold" />
+                    </div>
+                  </div>
+                </div>
+              `}
+            </div>
+            ${type === 'author' ? `
+              <div class="bg-amber-50/70 p-3 rounded-xl border border-amber-200 space-y-2">
+                <label class="text-xs font-bold text-amber-900 block">3. 勾選該作者的過往商品一併加入：</label>
+                <div class="space-y-1.5 max-h-40 overflow-y-auto bg-white p-2 rounded-lg border">
+                  ${pastWorksForAuthor.length === 0 ? '<div class="text-xs text-gray-400 text-center py-2">無過往商品紀錄</div>' : pastWorksForAuthor.map((p, idx) => `
+                    <label class="flex items-center gap-2 text-xs cursor-pointer hover:bg-gray-50 p-1 rounded">
+                      <input type="checkbox" class="author-past-work-chk w-3.5 h-3.5 accent-[#4A7C6F]" data-idx="${idx}" checked />
+                      <span class="font-bold text-gray-800">${p.name}</span>
+                      <span class="text-[#D96B43]">¥${p.price}</span>
+                    </label>
+                  `).join('')}
+                </div>
+              </div>
+            ` : ''}
+            <button type="button" onclick="confirmAddToEvent('${type}', '${srcEvId}', '${srcBoothId}', '${srcItemId}', '${authorName.replace(/'/g, "\'")}')" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold shadow-sm mt-2">確認加入活動</button>
+          </div>
+        `);
+      };
+
+      window.updateTargetEv = (evId) => { targetEvId = evId; window.renderAddToEventModalContent(); };
+      window.setBoothAction = (action) => { targetBoothAction = action; window.renderAddToEventModalContent(); };
+      window.filterBoothListInModal = (val) => {
+        const query = val.toLowerCase();
+        document.querySelectorAll('.booth-option-label').forEach(lbl => {
+          const txt = lbl.dataset.text || '';
+          lbl.style.display = txt.includes(query) ? 'flex' : 'none';
+        });
+      };
+
+      window.confirmAddToEvent = (t, sEvId, sBoothId, sItemId, aName) => {
+        const targetEv = state.events[targetEvId];
+        if (!targetEv) return alert('請選擇有效的目標活動');
+        let destBoothId = selectedBoothId;
+        if (targetBoothAction === 'new') {
+          const bCode = document.getElementById('new-added-booth-code').value.trim();
+          const bCircle = document.getElementById('new-added-booth-circle').value.trim();
+          if (!bCode || !bCircle) return alert('請填寫新攤位編號與社團名稱');
+          destBoothId = 'b_' + Date.now();
+          if (!targetEv.booths) targetEv.booths = {};
+          const order = Object.keys(targetEv.booths).length + 1;
+          let boothAuthors = [{ name: t === 'author' ? aName : '作者', links: [], sashiire: [], sashiireGiven: {} }];
+          if (t === 'item') {
+            const srcIt = state.events[sEvId]?.booths[sBoothId]?.items[sItemId];
+            const srcAuths = srcIt ? getItemAuthors(srcIt) : [];
+            if (srcAuths.length > 0) boothAuthors = srcAuths.map(an => ({ name: an, links: [], sashiire: [], sashiireGiven: {} }));
+          }
+          targetEv.booths[destBoothId] = {
+            id: destBoothId, code: bCode, circle: bCircle,
+            authors: boothAuthors, boothMapImage: '', flyerImages: [],
+            order, x: 50, y: 50, items: {}
+          };
+        }
+        if (!destBoothId && targetBoothAction === 'existing') {
+          const firstRadio = document.querySelector('input[name="target_booth_radio"]:checked') || document.querySelector('input[name="target_booth_radio"]');
+          if (firstRadio) destBoothId = firstRadio.value;
+        }
+        if (!targetEv.booths[destBoothId]) return alert('請選擇或建立目標攤位！');
+        const destBooth = targetEv.booths[destBoothId];
+        if (!destBooth.items) destBooth.items = {};
+
+        if (t === 'item') {
+          const srcIt = state.events[sEvId]?.booths[sBoothId]?.items[sItemId];
+          if (!srcIt) return alert('來源商品不存在');
+          const newId = 'item_' + Date.now();
+          const orders = {};
+          state.members.forEach(m => { orders[m] = { req: 0, bought: 0 }; });
+          destBooth.items[newId] = {
+            id: newId, name: srcIt.name, price: srcIt.price, reserve: srcIt.reserve || 0,
+            links: [...getItemLinks(srcIt)], tags: [...(srcIt.tags || [])], authors: [...getItemAuthors(srcIt)],
+            status: 'pending', itemImage: srcIt.itemImage || '', divisionCompleted: false,
+            order: Object.keys(destBooth.items).length + 1, orders
+          };
+          alert(`成功將「${srcIt.name}」加入「${targetEv.name}」的攤位 ${destBooth.code}！`);
+        } else if (t === 'author') {
+          const boothAuths = getBoothAuthors(destBooth);
+          if (!boothAuths.some(a => a.name === aName)) {
+            boothAuths.push({ name: aName, links: [], sashiire: [], sashiireGiven: {} });
+            destBooth.authors = boothAuths;
+          }
+          const chks = document.querySelectorAll('.author-past-work-chk:checked');
+          chks.forEach(chk => {
+            const p = pastWorksForAuthor[parseInt(chk.dataset.idx)];
+            if (!p) return;
+            const newId = 'item_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+            const orders = {};
+            state.members.forEach(m => { orders[m] = { req: 0, bought: 0 }; });
+            destBooth.items[newId] = {
+              id: newId, name: p.name, price: p.price, reserve: 0,
+              links: [...p.links], tags: [...p.tags], authors: [aName],
+              status: 'pending', itemImage: p.itemImage, divisionCompleted: false,
+              order: Object.keys(destBooth.items).length + 1, orders
+            };
+          });
+          alert(`成功將作者「${aName}」與 ${chks.length} 件商品加入「${targetEv.name}」！`);
+        }
+        closeModal(); saveData(); render();
+      };
+      window.renderAddToEventModalContent();
+    }
+
+    function openLibMemberDetailModal(memberName) {
+      const evList = getSortedEvents();
+      let activeEvId = state.activeEventId || (evList[0] && evList[0].id);
+
+      window.renderLibMemberModal = () => {
+        const ev = state.events[activeEvId];
+        if (!ev) return;
+        let totalPlan = 0, totalBought = 0;
+        const memberItems = [], pendingOrMissedItems = [];
+
+        Object.values(ev.booths || {}).forEach(b => {
+          Object.values(b.items || {}).forEach(it => {
+            const ord = it.orders && it.orders[memberName];
+            if (ord && (ord.req > 0 || ord.bought > 0)) {
+              totalPlan += ord.req * it.price;
+              totalBought += ord.bought * it.price;
+              memberItems.push({
+                boothId: b.id, itemId: it.id, boothCode: b.code, circle: b.circle,
+                itemName: it.name, price: it.price, req: ord.req, bought: ord.bought, status: it.status, itemImage: it.itemImage
+              });
+              if (it.status !== 'skip' && ord.bought < ord.req) {
+                pendingOrMissedItems.push({
+                  boothId: b.id, itemId: it.id, boothCode: b.code, circle: b.circle,
+                  itemName: it.name, price: it.price, req: ord.req, bought: ord.bought,
+                  tsuhanBought: ord.tsuhanBought || 0, status: it.status, itemImage: it.itemImage
+                });
+              }
+            }
+          });
+        });
+
+        const imgClass = state.libMemberImageMode === 'small' ? 'w-10 h-10' : state.libMemberImageMode === 'large' ? 'w-24 h-24' : 'w-16 h-16';
+
+        showModal(`
+          <div class="flex justify-between items-center mb-3 pb-2 border-b">
+            <div>
+              <h3 class="font-bold text-base text-gray-800">${memberName} · 成員庫明細</h3>
+              <p class="text-xs text-gray-400">跨活動檢視與管理</p>
+            </div>
+            <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+          </div>
+          <div class="flex gap-2 overflow-x-auto no-scrollbar py-1 mb-3">
+            ${evList.map(e => `
+              <button onclick="switchLibMemberEv('${e.id}', '${memberName}')" class="px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap ${e.id === activeEvId ? 'bg-[#4A7C6F] text-white' : 'bg-gray-100 text-gray-600'}">${e.name}</button>
+            `).join('')}
+          </div>
+          <div class="flex justify-between items-center mb-3 bg-gray-50 p-3 rounded-xl text-xs">
+            <div>預算: <span class="font-bold text-gray-700">${formatCurrency(totalPlan, activeEvId)}</span> | 應付: <span class="font-bold text-[#D96B43]">${formatCurrency(totalBought, activeEvId)}</span></div>
+            <div class="flex gap-1 bg-white p-0.5 rounded border shrink-0">
+              <button onclick="setLibMemberImageMode('small')" class="px-2 py-0.5 rounded text-[10px] ${state.libMemberImageMode === 'small' ? 'bg-[#4A7C6F] text-white font-bold' : 'text-gray-600'}">小圖</button>
+              <button onclick="setLibMemberImageMode('medium')" class="px-2 py-0.5 rounded text-[10px] ${state.libMemberImageMode === 'medium' ? 'bg-[#4A7C6F] text-white font-bold' : 'text-gray-600'}">中圖</button>
+              <button onclick="setLibMemberImageMode('large')" class="px-2 py-0.5 rounded text-[10px] ${state.libMemberImageMode === 'large' ? 'bg-[#4A7C6F] text-white font-bold' : 'text-gray-600'}">大圖</button>
+            </div>
+          </div>
+          <div class="space-y-4 max-h-[55vh] overflow-y-auto pr-1">
+            <details class="bg-indigo-50/70 rounded-xl border border-indigo-200 overflow-hidden" open>
+              <summary class="p-3 text-xs font-bold text-indigo-900 cursor-pointer select-none flex justify-between items-center bg-indigo-100/60">
+                <span><i class="fa-solid fa-bag-shopping mr-1"></i>待通販或下次場販商品列表 (${pendingOrMissedItems.length})</span>
+                <i class="fa-solid fa-chevron-down text-[10px]"></i>
+              </summary>
+              <div class="p-3 space-y-2 bg-white">
+                ${pendingOrMissedItems.length === 0 ? '<div class="text-xs text-gray-400 text-center py-2">此活動無未買齊商品</div>' : pendingOrMissedItems.map(item => `
+                  <div class="bg-gray-50 p-2.5 rounded-lg border space-y-1.5">
+                    <div class="flex justify-between items-center gap-2">
+                      <div class="flex items-center gap-2.5 min-w-0">
+                        ${item.itemImage ? `<img src="${getImageSrc(item.itemImage)}" class="${imgClass} object-cover rounded border shrink-0 transition-all" />` : `<div class="${imgClass} bg-gray-200 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>`}
+                        <div class="min-w-0">
+                          <div class="text-xs font-bold text-[#4A7C6F]">${item.boothCode} ${item.circle}</div>
+                          <div class="text-xs font-medium text-gray-800 truncate">${item.itemName} (需求 ${item.req} / 已買 ${item.bought})</div>
+                        </div>
+                      </div>
+                      <span class="text-[10px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded font-bold shrink-0">${item.status === 'soldout' ? '售空' : '未買齊'}</span>
+                    </div>
+                    <div class="flex justify-between items-center pt-1 text-xs">
+                      <span class="text-gray-500">通販買到數量：</span>
+                      <div class="flex items-center gap-1.5 bg-white px-2 py-1 rounded border">
+                        <button onclick="updateLibTsuhanQty('${activeEvId}', '${item.boothId}', '${item.itemId}', '${memberName}', -1)" class="w-5 h-5 rounded bg-gray-100 font-bold text-xs">-</button>
+                        <span class="font-bold w-6 text-center text-[#4A7C6F]">${item.tsuhanBought}</span>
+                        <button onclick="updateLibTsuhanQty('${activeEvId}', '${item.boothId}', '${item.itemId}', '${memberName}', 1)" class="w-5 h-5 rounded bg-[#4A7C6F]/15 font-bold text-xs text-[#4A7C6F]">+</button>
+                      </div>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+            </details>
+            <div class="space-y-2.5">
+              ${memberItems.length === 0 ? '<div class="text-center text-xs text-gray-400 py-6">此成員在此活動中無登記商品</div>' : memberItems.map(item => `
+                <div class="bg-[#F9FAF8] p-3 rounded-xl border flex items-center justify-between text-xs gap-2">
+                  <div class="flex items-center gap-2.5 min-w-0">
+                    ${item.itemImage ? `<img src="${getImageSrc(item.itemImage)}" class="${imgClass} object-cover rounded border shrink-0 transition-all" />` : `<div class="${imgClass} bg-gray-200 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0">無圖</div>`}
+                    <div class="min-w-0">
+                      <span class="font-bold text-[#4A7C6F]">${item.boothCode} ${item.circle}</span>
+                      <div class="font-bold text-gray-800 text-sm mt-0.5 truncate">${item.itemName}</div>
+                      <div class="text-gray-500 mt-0.5">單價 ${formatCurrency(item.price, activeEvId)} · 需求 ${item.req} / 已買 ${item.bought}</div>
+                    </div>
+                  </div>
+                  <div class="font-bold text-[#D96B43] text-sm shrink-0">${formatCurrency(item.bought * item.price, activeEvId)}</div>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        `);
+      };
+
+      window.setLibMemberImageMode = (mode) => { state.libMemberImageMode = mode; saveData(); window.renderLibMemberModal(); };
+      window.switchLibMemberEv = (evId, mName) => { activeEvId = evId; window.renderLibMemberModal(); };
+      window.updateLibTsuhanQty = (evId, boothId, itemId, mName, delta) => {
+        const ev = state.events[evId];
+        if (!ev || !ev.booths[boothId] || !ev.booths[boothId].items[itemId]) return;
+        const it = ev.booths[boothId].items[itemId];
+        if (!it.orders[mName]) it.orders[mName] = { req: 0, bought: 0, tsuhanBought: 0 };
+        it.orders[mName].tsuhanBought = Math.max(0, (it.orders[mName].tsuhanBought || 0) + delta);
+        saveData(); window.renderLibMemberModal();
+      };
+      window.renderLibMemberModal();
+    }
+
+    function addBoothAuthorBlock(boothId) {
+      const container = document.getElementById(`edit-authors-container-${boothId}`);
+      if (!container) return;
+      const aIdx = container.children.length;
+      const div = document.createElement('div');
+      div.className = `bg-white p-2.5 rounded-xl border space-y-2 edit-author-block-${boothId} relative`;
+      div.dataset.authorIdx = aIdx;
+      div.innerHTML = `
+        <div class="flex gap-1.5 items-center relative">
+          <div class="flex-1 relative">
+            <input type="text" value="" placeholder="新作者名稱 *" oninput="handleAuthorNameInputLive(this, '${boothId}', ${aIdx})" class="edit-author-name w-full border rounded-lg px-2.5 py-1 text-xs font-bold" autocomplete="off" />
+            <div class="author-search-dropdown hidden search-dropdown"></div>
+          </div>
+          <button type="button" onclick="removeThisParent(this.parentElement.parentElement)" class="text-red-400 px-1"><i class="fa-solid fa-trash text-xs"></i></button>
+        </div>
+        <div class="space-y-1">
+          <div class="flex justify-between items-center">
+            <span class="text-[10px] text-gray-400">作者鏈結 (可複數)</span>
+            <button type="button" onclick="addSingleAuthorLink(this)" class="text-[10px] text-[#4A7C6F] font-bold">+ 鏈結</button>
+          </div>
+          <div class="author-links-list space-y-1">
+            <div class="flex gap-1 items-center">
+              <input type="text" value="" placeholder="https://..." class="edit-author-link flex-1 border rounded px-2 py-0.5 text-[11px]" />
+              <button type="button" onclick="pasteToInput(this)" class="px-1.5 py-0.5 bg-gray-100 rounded text-[10px] font-bold">黏貼</button>
+              <button type="button" onclick="removeThisParent(this)" class="text-red-400 text-[10px] px-0.5"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+          </div>
+        </div>
+      `;
+      container.appendChild(div);
+    }
+
+    function addSingleAuthorLink(btn) {
+      const list = btn.parentElement.nextElementSibling;
+      if (!list) return;
+      const d = document.createElement('div');
+      d.className = 'flex gap-1 items-center';
+      d.innerHTML = `<input type="text" value="" placeholder="https://..." class="edit-author-link flex-1 border rounded px-2 py-0.5 text-[11px]" /><button type="button" onclick="pasteToInput(this)" class="px-1.5 py-0.5 bg-gray-100 rounded text-[10px] font-bold">黏貼</button><button type="button" onclick="removeThisParent(this)" class="text-red-400 text-[10px] px-0.5"><i class="fa-solid fa-xmark"></i></button>`;
+      list.appendChild(d);
+    }
+
+    function toggleEditSashiireMember(boothId, authorIdx, memberName) {
+      const booth = state.events[state.activeEventId].booths[boothId];
+      const authors = getBoothAuthors(booth);
+      if (!authors[authorIdx]) return;
+      if (!Array.isArray(authors[authorIdx].sashiire)) authors[authorIdx].sashiire = [];
+      const idx = authors[authorIdx].sashiire.indexOf(memberName);
+      if (idx === -1) authors[authorIdx].sashiire.push(memberName);
+      else authors[authorIdx].sashiire.splice(idx, 1);
+      booth.authors = authors;
+      saveData(); render();
+    }
+
+    function quickAddMemberForSashiire(boothId, authorIdx) {
+      const name = prompt('請輸入要新增的成員名字：');
+      if (!name || !name.trim()) return;
+      const clean = name.trim();
+      if (!state.members.includes(clean)) state.members.push(clean);
+      toggleEditSashiireMember(boothId, authorIdx, clean);
+    }
+
+    function moveItemOrder(boothId, itemId, direction) {
+      const booth = state.events[state.activeEventId].booths[boothId];
+      const items = getSortedItems(booth);
+      const idx = items.findIndex(i => i.id === itemId);
+      if (idx === -1) return;
+      const targetIdx = idx + direction;
+      if (targetIdx < 0 || targetIdx >= items.length) return;
+      const moved = items.splice(idx, 1)[0];
+      items.splice(targetIdx, 0, moved);
+      items.forEach((it, i) => { booth.items[it.id].order = i + 1; });
+      saveData(); render();
+    }
+
+    function triggerSummonForEditingBooth(boothId) {
+      const nameInputs = document.querySelectorAll(`.edit-author-block-${boothId} .edit-author-name`);
+      const authorNames = Array.from(nameInputs).map(i => i.value.trim()).filter(Boolean);
+      if (authorNames.length === 0) {
+        alert('請先在攤位資料中填寫至少一位作者名稱，才能召喚該作者的過往商品！');
+        return;
+      }
+      openSummonWorksModalForBooth(boothId, authorNames, false);
+    }
+
+    function triggerSummonForNewBooth() {
+      const nameInputs = document.querySelectorAll('.new-author-block .new-b-author-name');
+      const authorNames = Array.from(nameInputs).map(i => i.value.trim()).filter(Boolean);
+      if (authorNames.length === 0) {
+        alert('請先填寫至少一位作者名稱，才能召喚該作者的過往商品！');
+        return;
+      }
+      const code = document.getElementById('new-b-code').value.trim() || '未編號';
+      const circle = document.getElementById('new-b-circle').value.trim() || '未命名社團';
+      const authorBlocks = document.querySelectorAll('.new-author-block');
+      const authors = Array.from(authorBlocks).map((blk) => {
+        const name = blk.querySelector('.new-b-author-name').value.trim();
+        const links = Array.from(blk.querySelectorAll('.new-b-author-link')).map(i => i.value.trim()).filter(Boolean);
+        return { name, links, sashiire: [], sashiireGiven: {} };
+      }).filter(a => a.name);
+
+      const flyerItems = document.querySelectorAll('.new-b-flyer-item');
+      const flyerImages = [];
+      flyerItems.forEach(item => {
+        const thumb = item.querySelector('.flyer-thumb-box');
+        const linkInp = item.querySelector('.new-b-flyer-link');
+        const url = (thumb && thumb.dataset.url) || '';
+        const link = (linkInp && linkInp.value.trim()) || '';
+        if (url || link) flyerImages.push({ url, link });
+      });
+
+      const ev = state.events[state.activeEventId];
+      if (!ev.booths) ev.booths = {};
+      const newBoothId = 'b_' + Date.now();
+      const order = Object.keys(ev.booths).length + 1;
+
+      ev.booths[newBoothId] = {
+        id: newBoothId, code, circle, authors,
+        boothMapImage: tempNewBoothMapData,
+        flyerImages,
+        order, x: 50, y: 50, items: {}
+      };
+      tempNewBoothMapData = '';
+      saveData();
+      openSummonWorksModalForBooth(newBoothId, authorNames, true);
+    }
+
+    function openSummonWorksModalForBooth(boothId, authorNames, isFromNewBooth = false) {
+      const pastItems = [];
+      Object.values(state.events || {}).forEach(ev => {
+        Object.values(ev.booths || {}).forEach(b => {
+          if (b.id === boothId) return;
+          const bAuthors = getBoothAuthors(b).map(a => a.name).filter(Boolean);
+          Object.values(b.items || {}).forEach(it => {
+            const itAuthors = getItemAuthors(it);
+            const combinedAuthors = [...new Set([...bAuthors, ...itAuthors])];
+            pastItems.push({
+              eventName: ev.name, boothCode: b.code, circle: b.circle,
+              authors: combinedAuthors, name: it.name, price: it.price,
+              links: getItemLinks(it), tags: it.tags || [], itemImage: it.itemImage || ''
+            });
+          });
+        });
+      });
+
+      const filtered = pastItems.filter(p =>
+        p.authors.some(pa => authorNames.some(an => pa.includes(an) || an.includes(pa)))
+      );
+
+      showModal(`
+        <div class="flex justify-between items-center mb-3">
+          <div>
+            <h3 class="font-bold text-base text-gray-800"><i class="fa-solid fa-wand-magic-sparkles text-amber-600 mr-1"></i>召喚「${authorNames.join('、')}」的過往商品</h3>
+            <p class="text-[11px] text-gray-400">${isFromNewBooth ? '已建立新攤位，請勾選要一併加入的過往商品' : '勾選要複製帶入此攤位的過往商品'}</p>
+          </div>
+          <button onclick="closeModal(); render();" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="space-y-2 max-h-[55vh] overflow-y-auto pr-1 mb-4">
+          ${filtered.length === 0 ? `<div class="text-center text-xs text-gray-400 py-8">在歷史資料庫中找不到「${authorNames.join('、')}」的過往商品紀錄</div>` : filtered.map((p, idx) => `
+            <label class="flex items-center gap-2.5 bg-gray-50 p-2.5 rounded-xl border border-gray-200 cursor-pointer hover:bg-emerald-50/40">
+              <input type="checkbox" class="summon-work-checkbox w-4 h-4 accent-[#4A7C6F]" data-idx="${idx}" checked />
+              ${getImageSrc(p.itemImage) ? `<img src="${getImageSrc(p.itemImage)}" class="w-10 h-10 object-cover rounded border shrink-0" />` : ''}
+              <div class="flex-1 min-w-0">
+                <div class="text-xs font-bold text-gray-800 truncate">${p.name} <span class="text-[#D96B43] ml-1">¥${p.price}</span></div>
+                <div class="text-[10px] text-gray-400 truncate">${p.eventName} · ${p.circle} (${p.authors.join('、')})</div>
+              </div>
+            </label>
+          `).join('')}
+        </div>
+        <button type="button" id="btn-confirm-summon" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold shadow-sm">確認召喚並加入攤位</button>
+      `);
+
+      document.getElementById('btn-confirm-summon').onclick = () => {
+        const checkedBoxes = document.querySelectorAll('.summon-work-checkbox:checked');
+        if (checkedBoxes.length === 0) { closeModal(); render(); return; }
+        const ev = state.events[state.activeEventId];
+        if (!ev || !ev.booths[boothId]) { closeModal(); return; }
+        if (!ev.booths[boothId].items) ev.booths[boothId].items = {};
+        let orderCounter = Object.keys(ev.booths[boothId].items).length + 1;
+        checkedBoxes.forEach(cb => {
+          const p = filtered[parseInt(cb.dataset.idx)];
+          if (!p) return;
+          const newId = 'item_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+          const orders = {};
+          state.members.forEach(m => { orders[m] = { req: 0, bought: 0 }; });
+          const matchedItemAuthors = p.authors.filter(pa => authorNames.some(an => pa.includes(an) || an.includes(pa)));
+          ev.booths[boothId].items[newId] = {
+            id: newId, name: p.name, price: p.price, reserve: 0,
+            links: [...p.links], tags: [...p.tags],
+            authors: matchedItemAuthors.length > 0 ? matchedItemAuthors : [...authorNames],
+            order: orderCounter++, status: 'pending', itemImage: p.itemImage,
+            divisionCompleted: false, orders
+          };
+        });
+        closeModal(); saveData(); render();
+      };
+    }
+
+    function selectEvent(id) { state.activeEventId = id; state.settleEventId = id; render(); }
+    function setRunMode(mode) { state.runMode = mode; render(); }
+    function toggleBoothEdit(boothId) { state.editingBooths[boothId] = !state.editingBooths[boothId]; render(); }
+
+    async function pasteToInput(btn) {
+      try {
+        const text = await navigator.clipboard.readText();
+        const input = btn.previousElementSibling;
+        if (input && input.tagName === 'INPUT') input.value = text;
+      } catch (err) { alert('無法讀取剪貼板，請手動貼上'); }
+    }
+
+    function addItemLinkInput(itemId) {
+      const container = document.getElementById(`item-links-container-${itemId}`);
+      if (!container) return;
+      const div = document.createElement('div');
+      div.className = 'flex gap-1.5 items-center';
+      div.innerHTML = `
+        <input type="text" value="" placeholder="https://..." class="item-link-input-${itemId} flex-1 border rounded px-2 py-1 text-xs" />
+        <button type="button" onclick="pasteToInput(this)" class="px-2 py-0.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded text-[10px] font-bold">黏貼</button>
+        <button type="button" onclick="removeThisParent(this)" class="text-red-400 px-1"><i class="fa-solid fa-trash text-xs"></i></button>
+      `;
+      container.appendChild(div);
+    }
+
+    function removeThisParent(btn) { btn.parentElement.remove(); }
+
+    function appendTagToInput(inputId, tag) {
+      const input = document.getElementById(inputId);
+      if (!input) return;
+      const current = input.value.split(',').map(s => s.trim()).filter(Boolean);
+      if (!current.includes(tag)) {
+        current.push(tag);
+        input.value = current.join(', ');
+      }
+    }
+
+    function finishBoothEdit(boothId) {
+      const codeInput = document.getElementById(`edit-b-code-${boothId}`);
+      const circleInput = document.getElementById(`edit-b-circle-${boothId}`);
+      if (codeInput && circleInput) {
+        const code = codeInput.value.trim() || '未編號';
+        const circle = circleInput.value.trim() || '未命名社團';
+        const booth = state.events[state.activeEventId].booths[boothId];
+        const prevAuthors = getBoothAuthors(booth);
+        const authorBlocks = document.querySelectorAll(`.edit-author-block-${boothId}`);
+        const updatedAuthors = Array.from(authorBlocks).map((blk, idx) => {
+          const name = blk.querySelector('.edit-author-name').value.trim();
+          const links = Array.from(blk.querySelectorAll('.edit-author-link')).map(i => i.value.trim()).filter(Boolean);
+          const prev = prevAuthors[idx] || { sashiire: [], sashiireGiven: {} };
+          return { name, links, sashiire: prev.sashiire || [], sashiireGiven: prev.sashiireGiven || {} };
+        }).filter(a => a.name);
+        if (updatedAuthors.length === 0) return alert('請填寫至少一位作者名稱');
+
+        const flyers = getBoothFlyers(booth);
+        flyers.forEach((f, idx) => {
+          const lInp = document.querySelector(`.flyer-link-input-${boothId}-${idx}`);
+          if (lInp) f.link = lInp.value.trim();
+        });
+
+        booth.code = code;
+        booth.circle = circle;
+        booth.authors = updatedAuthors;
+        booth.flyerImages = flyers;
+      }
+      state.editingBooths[boothId] = false;
+      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
+      saveData(false, boothPath, state.events[state.activeEventId].booths[boothId]);
+    }
+
+    function deleteBooth(boothId) {
+      if (!confirm('確定要刪除此攤位及攤位內的所有商品嗎？此操作無法復原！')) return;
+      delete state.events[state.activeEventId].booths[boothId];
+      state.editingBooths[boothId] = false;
+      saveData(); render();
+    }
+
+    // ------------------------------------------
+    // 圖片上傳與剪貼板貼上（全部強制壓縮，防止大容量超載與同步失敗）
+    // ------------------------------------------
+    async function extractCompressedImageFromClipboard(maxWidth = 560, quality = 0.68) {
+      const clipboardItems = await navigator.clipboard.read();
+      for (const clipboardItem of clipboardItems) {
+        for (const type of clipboardItem.types) {
+          if (type.startsWith('image/')) {
+            const blob = await clipboardItem.getType(type);
+            return await readBlobOrFileAsCompressedDataUrl(blob, maxWidth, quality);
+          }
+        }
+      }
+      return null;
+    }
+
+    async function handleBoothMapUpload(e, boothId) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const booth = state.events[state.activeEventId]?.booths?.[boothId];
+      if (!booth) return;
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.boothMap.maxWidth, IMAGE_PRESETS.boothMap.quality);
+      booth.boothMapImage = await externalizeLargeImage(compressed);
+      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
+      await saveData(false, boothPath, booth);
+    }
+
+    async function pasteBoothMap(boothId) {
+      try {
+        const compressed = await extractCompressedImageFromClipboard(IMAGE_PRESETS.boothMap.maxWidth, IMAGE_PRESETS.boothMap.quality);
+        if (!compressed) {
+          alert('剪貼板中沒有找到圖片');
+          return;
+        }
+        const booth = state.events[state.activeEventId]?.booths?.[boothId];
+        if (!booth) return;
+        booth.boothMapImage = await externalizeLargeImage(compressed);
+        const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
+        await saveData(false, boothPath, booth);
+      } catch (err) {
+        alert('無法讀取剪貼板圖片，請確認瀏覽器已允許剪貼板權限，或改用「選擇圖片」上傳。');
+      }
+    }
+
+    async function handleBoothFlyerUpload(e, boothId) {
+      const files = Array.from(e.target.files);
+      if (!files.length) return;
+      const booth = state.events[state.activeEventId]?.booths?.[boothId];
+      if (!booth) return;
+      if (!Array.isArray(booth.flyerImages)) {
+        booth.flyerImages = booth.flyerImage ? [{ url: booth.flyerImage, link: '' }] : [];
+      }
+      for (const file of files) {
+        const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.flyer.maxWidth, IMAGE_PRESETS.flyer.quality);
+        const storedUrl = await externalizeLargeImage(compressed);
+        booth.flyerImages.push({ url: storedUrl, link: '' });
+      }
+      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
+      await saveData(false, boothPath, booth);
+    }
+
+    async function handleSingleBoothFlyerUpload(e, boothId, flyerIdx) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const booth = state.events[state.activeEventId]?.booths?.[boothId];
+      if (!booth) return;
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.flyer.maxWidth, IMAGE_PRESETS.flyer.quality);
+      const storedUrl = await externalizeLargeImage(compressed);
+      const flyers = getBoothFlyers(booth);
+      if (flyers[flyerIdx]) flyers[flyerIdx].url = storedUrl;
+      booth.flyerImages = flyers;
+      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
+      await saveData(false, boothPath, booth);
+    }
+
+    async function pasteBoothFlyer(boothId) {
+      try {
+        const compressed = await extractCompressedImageFromClipboard(IMAGE_PRESETS.flyer.maxWidth, IMAGE_PRESETS.flyer.quality);
+        if (!compressed) {
+          alert('剪貼板中沒有找到圖片');
+          return;
+        }
+        const booth = state.events[state.activeEventId]?.booths?.[boothId];
+        if (!booth) return;
+        if (!Array.isArray(booth.flyerImages)) {
+          booth.flyerImages = booth.flyerImage ? [{ url: booth.flyerImage, link: '' }] : [];
+        }
+        const storedUrl = await externalizeLargeImage(compressed);
+        booth.flyerImages.push({ url: storedUrl, link: '' });
+        const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
+        await saveData(false, boothPath, booth);
+      } catch (err) {
+        alert('無法讀取剪貼板');
+      }
+    }
+
+    async function pasteSingleBoothFlyer(boothId, flyerIdx) {
+      try {
+        const compressed = await extractCompressedImageFromClipboard(IMAGE_PRESETS.flyer.maxWidth, IMAGE_PRESETS.flyer.quality);
+        if (!compressed) {
+          alert('剪貼板中沒有找到圖片');
+          return;
+        }
+        const booth = state.events[state.activeEventId]?.booths?.[boothId];
+        if (!booth) return;
+        const flyers = getBoothFlyers(booth);
+        const storedUrl = await externalizeLargeImage(compressed);
+        if (flyers[flyerIdx]) flyers[flyerIdx].url = storedUrl;
+        booth.flyerImages = flyers;
+        const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
+        await saveData(false, boothPath, booth);
+      } catch (err) {
+        alert('無法讀取剪貼板');
+      }
+    }
+
+    function removeBoothFlyer(boothId, flyerIdx) {
+      const booth = state.events[state.activeEventId]?.booths?.[boothId];
+      if (!booth) return;
+      const flyers = getBoothFlyers(booth);
+      flyers.splice(flyerIdx, 1);
+      booth.flyerImages = flyers;
+      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
+      saveData(false, boothPath, booth);
+    }
+
+    function toggleItemEdit(itemId) { state.editingItems[itemId] = !state.editingItems[itemId]; render(); }
+
+    async function handleItemImageUpload(e, boothId, itemId) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const item = state.events[state.activeEventId]?.booths?.[boothId]?.items?.[itemId];
+      if (!item) return;
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.item.maxWidth, IMAGE_PRESETS.item.quality);
+      item.itemImage = await externalizeLargeImage(compressed);
+      const itemPath = `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`;
+      await saveData(false, itemPath, item);
+    }
+
+    async function pasteItemImage(boothId, itemId) {
+      try {
+        const compressed = await extractCompressedImageFromClipboard(IMAGE_PRESETS.item.maxWidth, IMAGE_PRESETS.item.quality);
+        if (!compressed) {
+          alert('剪貼板中沒有找到圖片');
+          return;
+        }
+        const item = state.events[state.activeEventId]?.booths?.[boothId]?.items?.[itemId];
+        if (!item) return;
+        item.itemImage = await externalizeLargeImage(compressed);
+        const itemPath = `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`;
+        await saveData(false, itemPath, item);
+      } catch (err) {
+        alert('無法讀取剪貼板');
+      }
+    }
+
+    let cropState = { boothId: null, itemId: null, flyerIdx: 0, isNewItemModal: false, box: { x: 20, y: 20, w: 50, h: 50 } };
+
+    function openCropFromFlyerModal(boothId, itemId, flyerIdx = 0, isNewItemModal = false) {
+      const booth = state.events[state.activeEventId].booths[boothId];
+      const flyers = getBoothFlyers(booth);
+      if (flyers.length === 0 || !getImageSrc(flyers[0].url)) return alert('此攤位尚未上傳或黏貼攤位宣傳圖！');
+      cropState = { boothId, itemId, flyerIdx: Math.min(flyerIdx, flyers.length - 1), isNewItemModal, box: { x: 20, y: 20, w: 50, h: 50 } };
+      renderCropModal();
+    }
+
+    function renderCropModal() {
+      const { boothId, flyerIdx, box } = cropState;
+      const booth = state.events[state.activeEventId].booths[boothId];
+      const flyers = getBoothFlyers(booth);
+      const currentImg = flyers[flyerIdx] ? getImageSrc(flyers[flyerIdx].url) : '';
+      showModal(`
+        <div class="flex justify-between items-center mb-2">
+          <h3 class="font-bold text-sm text-gray-800"><i class="fa-solid fa-crop-simple text-[#4A7C6F] mr-1"></i>截取商品圖片</h3>
+          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        ${flyers.length > 1 ? `
+          <div class="flex gap-2 overflow-x-auto pb-2 mb-2">
+            ${flyers.map((f, idx) => `
+              <button onclick="switchCropFlyer(${idx})" class="px-2.5 py-1 rounded-lg text-xs font-bold border shrink-0 ${idx === flyerIdx ? 'bg-[#4A7C6F] text-white border-[#4A7C6F]' : 'bg-gray-50 text-gray-600 border-gray-200'}">宣傳圖 ${idx + 1}</button>
+            `).join('')}
+          </div>
+        ` : ''}
+        <p class="text-[11px] text-gray-500 mb-2">拖曳方框移動位置，拉動四個角落調整截取範圍：</p>
+        <div id="crop-stage" class="relative w-full overflow-hidden rounded-xl border border-gray-300 bg-black select-none touch-none mx-auto">
+          <img id="crop-source-img" src="${currentImg}" class="w-full h-auto block pointer-events-none" />
+          <div id="crop-box" style="left: ${box.x}%; top: ${box.y}%; width: ${box.w}%; height: ${box.h}%;" class="absolute border-2 border-white crop-box-shadow cursor-move">
+            <div data-handle="nw" class="crop-handle absolute -top-2 -left-2 w-4 h-4 bg-white border-2 border-[#4A7C6F] rounded-full"></div>
+            <div data-handle="ne" class="crop-handle absolute -top-2 -right-2 w-4 h-4 bg-white border-2 border-[#4A7C6F] rounded-full"></div>
+            <div data-handle="sw" class="crop-handle absolute -bottom-2 -left-2 w-4 h-4 bg-white border-2 border-[#4A7C6F] rounded-full"></div>
+            <div data-handle="se" class="crop-handle absolute -bottom-2 -right-2 w-4 h-4 bg-white border-2 border-[#4A7C6F] rounded-full"></div>
+          </div>
+        </div>
+        <div class="flex gap-2 mt-4">
+          <button onclick="closeModal()" class="flex-1 py-2.5 rounded-xl bg-gray-100 text-gray-700 text-xs font-bold">取消</button>
+          <button onclick="confirmCropImage()" class="flex-2 w-2/3 btn-primary py-2.5 rounded-xl text-xs font-bold shadow-sm">完成（儲存）</button>
+        </div>
+      `);
+      bindCropEvents();
+    }
+
+    function switchCropFlyer(idx) { cropState.flyerIdx = idx; cropState.box = { x: 20, y: 20, w: 50, h: 50 }; renderCropModal(); }
+
+    function bindCropEvents() {
+      const stage = document.getElementById('crop-stage');
+      const cropBox = document.getElementById('crop-box');
+      if (!stage || !cropBox) return;
+      let action = null, startX = 0, startY = 0, startBox = { ...cropState.box };
+      const onStart = (e) => {
+        const touch = e.touches ? e.touches[0] : e;
+        startX = touch.clientX; startY = touch.clientY; startBox = { ...cropState.box };
+        if (e.target.dataset.handle) action = e.target.dataset.handle;
+        else if (e.target === cropBox || cropBox.contains(e.target)) action = 'move';
+      };
+      const onMove = (e) => {
+        if (!action) return;
+        e.preventDefault();
+        const touch = e.touches ? e.touches[0] : e;
+        const rect = stage.getBoundingClientRect();
+        const dxPct = ((touch.clientX - startX) / rect.width) * 100;
+        const dyPct = ((touch.clientY - startY) / rect.height) * 100;
+        let { x, y, w, h } = startBox;
+        const minSize = 10;
+        if (action === 'move') { x = Math.max(0, Math.min(100 - w, x + dxPct)); y = Math.max(0, Math.min(100 - h, y + dyPct)); }
+        else if (action === 'se') { w = Math.max(minSize, Math.min(100 - x, w + dxPct)); h = Math.max(minSize, Math.min(100 - y, h + dyPct)); }
+        else if (action === 'sw') { const newX = Math.max(0, Math.min(x + w - minSize, x + dxPct)); w = w + (x - newX); x = newX; h = Math.max(minSize, Math.min(100 - y, h + dyPct)); }
+        else if (action === 'ne') { w = Math.max(minSize, Math.min(100 - x, w + dxPct)); const newY = Math.max(0, Math.min(y + h - minSize, y + dyPct)); h = h + (y - newY); y = newY; }
+        else if (action === 'nw') { const newX = Math.max(0, Math.min(x + w - minSize, x + dxPct)); w = w + (x - newX); x = newX; const newY = Math.max(0, Math.min(y + h - minSize, y + dyPct)); h = h + (y - newY); y = newY; }
+        cropState.box = { x, y, w, h };
+        cropBox.style.left = x + '%'; cropBox.style.top = y + '%';
+        cropBox.style.width = w + '%'; cropBox.style.height = h + '%';
+      };
+      const onEnd = () => { action = null; };
+      stage.addEventListener('mousedown', onStart);
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onEnd);
+      stage.addEventListener('touchstart', onStart, { passive: false });
+      window.addEventListener('touchmove', onMove, { passive: false });
+      window.addEventListener('touchend', onEnd);
+    }
+
+    async function confirmCropImage() {
+      const imgEl = document.getElementById('crop-source-img');
+      if (!imgEl) return;
+      const { boothId, itemId, isNewItemModal, box } = cropState;
+      const naturalW = imgEl.naturalWidth || imgEl.width;
+      const naturalH = imgEl.naturalHeight || imgEl.height;
+      const sx = (box.x / 100) * naturalW;
+      const sy = (box.y / 100) * naturalH;
+      const sw = (box.w / 100) * naturalW;
+      const sh = (box.h / 100) * naturalH;
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(sw));
+      canvas.height = Math.max(1, Math.round(sh));
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+      const croppedUrl = await compressImageDataUrl(canvas.toDataURL('image/jpeg', 0.8), IMAGE_PRESETS.item.maxWidth, IMAGE_PRESETS.item.quality);
+      if (isNewItemModal) {
+        tempNewItemImageData = croppedUrl;
+        openNewItemModal(boothId);
+      } else {
+        const item = state.events[state.activeEventId]?.booths?.[boothId]?.items?.[itemId];
+        if (!item) { closeModal(); return; }
+        item.itemImage = await externalizeLargeImage(croppedUrl);
+        const itemPath = `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`;
+        await saveData(false, itemPath, item);
+        closeModal();
+      }
+    }
+
+    function updateBoughtQty(boothId, itemId, member, delta) {
+      const booth = state.events[state.activeEventId]?.booths?.[boothId];
+      const item = booth?.items?.[itemId];
+      if (!item) return;
+
+      if (item.divisionCompleted) item.divisionCompleted = false;
+      if (!item.orders) item.orders = {};
+      if (!item.orders[member]) item.orders[member] = { req: 0, bought: 0 };
+
+      const nextVal = Math.max(0, (item.orders[member].bought || 0) + delta);
+      item.orders[member].bought = nextVal;
+
+      const allMet = Object.values(item.orders).every(o => (o.bought || 0) >= (o.req || 0));
+      if (allMet && nextVal > 0) item.status = 'done';
+      else if (item.status === 'done' && !allMet) item.status = 'pending';
+
+      const itemPath = `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`;
+      saveData(false, itemPath, item);
+    }
+
+    function setItemStatus(boothId, itemId, status) {
+      const item = state.events[state.activeEventId].booths[boothId].items[itemId];
+      if (item.divisionCompleted) item.divisionCompleted = false;
+      if (status === 'soldout') {
+        item.status = 'soldout';
+        Object.keys(item.orders || {}).forEach(m => { if (item.orders[m]) item.orders[m].bought = 0; });
+        item.purchasedBy = {};
+      } else if (status === 'done') {
+        item.status = 'done';
+        Object.keys(item.orders || {}).forEach(m => { if (item.orders[m]) item.orders[m].bought = item.orders[m].req; });
+      } else {
+        item.status = status;
+      }
+      const itemPath = `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`;
+      saveData(false, itemPath, item);
+    }
+
+    function toggleSkip(boothId, itemId) {
+      const item = state.events[state.activeEventId].booths[boothId].items[itemId];
+      item.status = item.status === 'skip' ? 'pending' : 'skip';
+      const itemPath = `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`;
+      saveData(false, itemPath, item);
+    }
+
+    function deleteItem(boothId, itemId) {
+      if (!confirm('確定要刪除這項商品嗎？')) return;
+      delete state.events[state.activeEventId].booths[boothId].items[itemId];
+      saveData();
+    }
+
+    function showModal(htmlContent) {
+      document.getElementById('modal-box').innerHTML = htmlContent;
+      document.getElementById('modal-backdrop').classList.remove('hidden');
+    }
+    function closeModal() {
+      currentOpenMemberModal = null;
+      document.getElementById('modal-backdrop').classList.add('hidden');
+    }
+
+    function openMemberModal() {
+      showModal(`
+        <div class="flex justify-between items-center mb-4">
+          <h3 class="font-bold text-base">管理同行夥伴名單</h3>
+          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="flex gap-2 mb-4">
+          <input id="new-member-name" type="text" placeholder="輸入夥伴名字 (例: 小明)" class="flex-1 border rounded-xl px-3 py-2 text-sm" />
+          <button onclick="addMember()" class="btn-primary px-4 py-2 rounded-xl text-sm font-bold">新增</button>
+        </div>
+        <div class="space-y-2">
+          ${state.members.map((m, i) => `
+            <div class="flex justify-between items-center bg-gray-50 px-3 py-2 rounded-xl text-sm">
+              <span>${m}</span>
+              ${state.members.length > 1 ? `<button onclick="removeMember(${i})" class="text-red-400 text-xs">移除</button>` : ''}
+            </div>
+          `).join('')}
+        </div>
+      `);
+    }
+
+    function addMember() {
+      const name = document.getElementById('new-member-name').value.trim();
+      if (!name || state.members.includes(name)) return;
+      state.members.push(name);
+      saveData(); openMemberModal();
+    }
+
+    function removeMember(idx) {
+      state.members.splice(idx, 1);
+      saveData(); openMemberModal();
+    }
+
+    function openNewEventModal() {
+      showModal(`
+        <div class="flex justify-between items-center mb-4">
+          <h3 class="font-bold text-base">新建展會活動</h3>
+          <button id="btn-close-new-ev" type="button" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="space-y-3">
+          <div>
+            <label class="text-xs text-gray-500">活動名稱 *</label>
+            <input id="ev-name" type="text" placeholder="例如：C106 夏季場 / CWT" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+            <div id="ev-name-error" class="text-red-500 text-[11px] mt-1 hidden">請輸入活動名稱</div>
+          </div>
+          <div>
+            <label class="text-xs text-gray-500">活動日期</label>
+            <input id="ev-date" type="date" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+          </div>
+          <div>
+            <label class="text-xs text-gray-500">展館名稱</label>
+            <input id="ev-hall" type="text" placeholder="例如：西1館 / 東4館" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+          </div>
+          <div>
+            <label class="text-xs text-gray-500">貨幣與記號</label>
+            <select id="ev-currency" class="w-full border rounded-xl px-3 py-2 text-sm mt-1 font-bold bg-white">
+              <option value="JPY|¥">日元 JPY (¥)</option>
+              <option value="HKD|$">港幣 HKD ($)</option>
+              <option value="TWD|NT$">台幣 TWD (NT$)</option>
+              <option value="USD|$">美元 USD ($)</option>
+              <option value="EUR|€">歐元 EUR (€)</option>
+              <option value="GBP|£">英鎊 GBP (£)</option>
+              <option value="CNY|¥">人民幣 CNY (¥)</option>
+            </select>
+          </div>
+          <button id="btn-submit-new-ev" type="button" class="w-full btn-primary py-3 rounded-xl text-sm font-bold mt-2">確認建立</button>
+        </div>
+      `);
+      document.getElementById('btn-close-new-ev').onclick = closeModal;
+      document.getElementById('btn-submit-new-ev').onclick = () => {
+        const nameInput = document.getElementById('ev-name');
+        const errDiv = document.getElementById('ev-name-error');
+        const name = nameInput.value.trim();
+        if (!name) { errDiv.classList.remove('hidden'); nameInput.focus(); return; }
+        errDiv.classList.add('hidden');
+        const date = document.getElementById('ev-date').value || '';
+        const hall = document.getElementById('ev-hall').value.trim();
+        const curRaw = document.getElementById('ev-currency').value.split('|');
+        const id = 'ev_' + Date.now();
+        state.events[id] = {
+          id, name, date, hall, currency: curRaw[0], currencySymbol: curRaw[1],
+          mapImage: '', createdAt: Date.now(), booths: {}
+        };
+        if (!state.runnersByEvent) state.runnersByEvent = {};
+        state.runnersByEvent[id] = [state.members[0] || '麻油'];
+        state.activeEventId = id;
+        state.settleEventId = id;
+        closeModal(); saveData(); render();
+      };
+    }
+
+    function openEditEventModal(evId) {
+      const ev = state.events[evId];
+      if (!ev) return;
+      const curVal = `${ev.currency || 'JPY'}|${ev.currencySymbol || '¥'}`;
+      showModal(`
+        <div class="flex justify-between items-center mb-4">
+          <h3 class="font-bold text-base">編輯展會活動</h3>
+          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="space-y-3">
+          <div>
+            <label class="text-xs text-gray-500">活動名稱 *</label>
+            <input id="edit-ev-name" type="text" value="${ev.name}" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+          </div>
+          <div>
+            <label class="text-xs text-gray-500">活動日期</label>
+            <input id="edit-ev-date" type="date" value="${ev.date || ''}" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+          </div>
+          <div>
+            <label class="text-xs text-gray-500">展館名稱</label>
+            <input id="edit-ev-hall" type="text" value="${ev.hall || ''}" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+          </div>
+          <div>
+            <label class="text-xs text-gray-500">貨幣與記號</label>
+            <select id="edit-ev-currency" class="w-full border rounded-xl px-3 py-2 text-sm mt-1 font-bold bg-white">
+              <option value="JPY|¥" ${curVal === 'JPY|¥' ? 'selected' : ''}>日元 JPY (¥)</option>
+              <option value="HKD|$" ${curVal === 'HKD|$' ? 'selected' : ''}>港幣 HKD ($)</option>
+              <option value="TWD|NT$" ${curVal === 'TWD|NT$' ? 'selected' : ''}>台幣 TWD (NT$)</option>
+              <option value="USD|$" ${curVal === 'USD|$' ? 'selected' : ''}>美元 USD ($)</option>
+              <option value="EUR|€" ${curVal === 'EUR|€' ? 'selected' : ''}>歐元 EUR (€)</option>
+              <option value="GBP|£" ${curVal === 'GBP|£' ? 'selected' : ''}>英鎊 GBP (£)</option>
+              <option value="CNY|¥" ${curVal === 'CNY|¥' ? 'selected' : ''}>人民幣 CNY (¥)</option>
+            </select>
+          </div>
+          <div class="flex gap-2 pt-2">
+            <button type="button" onclick="deleteEvent('${evId}')" class="px-4 py-2.5 rounded-xl bg-red-100 text-red-600 text-xs font-bold">刪除活動</button>
+            <button type="button" onclick="saveEditedEvent('${evId}')" class="flex-1 btn-primary py-2.5 rounded-xl text-sm font-bold shadow-sm">儲存變更</button>
+          </div>
+        </div>
+      `);
+    }
+
+    function saveEditedEvent(evId) {
+      const name = document.getElementById('edit-ev-name').value.trim();
+      if (!name) return alert('請輸入活動名稱');
+      const ev = state.events[evId];
+      ev.name = name;
+      ev.date = document.getElementById('edit-ev-date').value || '';
+      ev.hall = document.getElementById('edit-ev-hall').value.trim();
+      const curRaw = document.getElementById('edit-ev-currency').value.split('|');
+      ev.currency = curRaw[0];
+      ev.currencySymbol = curRaw[1];
+      closeModal(); saveData(); render();
+    }
+
+    function deleteEvent(evId) {
+      if (!confirm('確定要刪除整個展會活動嗎？這會連帶刪除活動內所有攤位與商品，無法復原！')) return;
+      delete state.events[evId];
+      if (state.runnersByEvent) delete state.runnersByEvent[evId];
+      if (state.runnerOrders) delete state.runnerOrders[evId];
+      const rem = getSortedEvents();
+      state.activeEventId = rem.length > 0 ? rem[0].id : null;
+      state.settleEventId = state.activeEventId;
+      closeModal();
+      saveData(rem.length === 0);
+      render();
+    }
+
+    let tempNewBoothMapData = '';
+
+    function openNewBoothModal() {
+      tempNewBoothMapData = '';
+      showModal(`
+        <div class="flex justify-between items-center mb-3">
+          <div class="flex items-center gap-2">
+            <h3 class="font-bold text-base">新增攤位</h3>
+            <button type="button" onclick="triggerSummonForNewBooth()" class="px-2.5 py-1 rounded-lg bg-amber-100 text-amber-800 border border-amber-300 text-xs font-bold shadow-sm hover:bg-amber-200 transition">
+              <i class="fa-solid fa-wand-magic-sparkles mr-1"></i>召喚商品
+            </button>
+          </div>
+          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="space-y-3 max-h-[75vh] overflow-y-auto pr-1">
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="text-xs text-gray-500">攤位編號 (選填)</label>
+              <input id="new-b-code" type="text" placeholder="例: B-12a" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+            </div>
+            <div>
+              <label class="text-xs text-gray-500">社團名稱 (選填)</label>
+              <input id="new-b-circle" type="text" placeholder="社團名" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+            </div>
+          </div>
+
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border space-y-2">
+            <div class="flex justify-between items-center">
+              <label class="text-xs font-bold text-gray-700">作者資料 (可多位)</label>
+              <button type="button" onclick="addNewModalAuthorBlock()" class="text-xs text-[#4A7C6F] font-bold">+ 新增作者</button>
+            </div>
+            <div id="new-b-authors-list" class="space-y-2">
+              <div class="bg-white p-2.5 rounded-xl border space-y-2 new-author-block relative" data-idx="0">
+                <div class="relative">
+                  <input type="text" placeholder="作者名稱 *" oninput="handleNewAuthorNameInputLive(this, 0)" class="new-b-author-name w-full border rounded-lg px-2.5 py-1 text-xs font-bold" autocomplete="off" />
+                  <div class="author-search-dropdown hidden search-dropdown"></div>
+                </div>
+                <div class="space-y-1">
+                  <div class="flex justify-between items-center">
+                    <span class="text-[10px] text-gray-400">作者鏈結 (可複數)</span>
+                    <button type="button" onclick="addNewModalAuthorLink(this)" class="text-[10px] text-[#4A7C6F] font-bold">+ 鏈結</button>
+                  </div>
+                  <div class="author-links-list space-y-1">
+                    <div class="flex gap-1 items-center">
+                      <input type="text" placeholder="https://..." class="new-b-author-link flex-1 border rounded px-2 py-0.5 text-[11px]" />
+                      <button type="button" onclick="pasteToInput(this)" class="px-1.5 py-0.5 bg-gray-100 rounded text-[10px] font-bold">黏貼</button>
+                      <button type="button" onclick="removeThisParent(this)" class="text-red-400 text-[10px] px-0.5"><i class="fa-solid fa-xmark"></i></button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border">
+            <label class="text-xs font-bold text-gray-700 block mb-1.5">攤位圖 (選填)</label>
+            <div class="flex items-center gap-2">
+              <div id="new-b-map-preview" class="w-12 h-12 bg-gray-200/70 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0 overflow-hidden">無圖</div>
+              <label class="flex-1 text-center py-2 px-2 bg-white border border-gray-300 rounded-lg text-xs font-medium text-gray-700 cursor-pointer">
+                選擇圖片
+                <input type="file" accept="image/*" onchange="handleNewBoothMapUpload(event)" class="hidden" />
+              </label>
+              <button type="button" onclick="pasteNewBoothMap()" class="py-2 px-3 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-lg text-xs font-bold shrink-0">黏貼</button>
+            </div>
+          </div>
+
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border space-y-2">
+            <div class="flex justify-between items-center">
+              <label class="text-xs font-bold text-gray-700">攤宣與鏈結 (可多張)</label>
+              <button type="button" onclick="addNewModalFlyerBlock()" class="text-xs text-[#4A7C6F] font-bold">+ 新增攤宣</button>
+            </div>
+            <div id="new-b-flyers-list" class="space-y-2"></div>
+          </div>
+
+          <button onclick="createBooth()" class="w-full btn-primary py-3 rounded-xl text-sm font-bold mt-2">加入攤位</button>
+        </div>
+      `);
+    }
+
+    function addNewModalAuthorBlock() {
+      const list = document.getElementById('new-b-authors-list');
+      if (!list) return;
+      const idx = list.children.length;
+      const d = document.createElement('div');
+      d.className = 'bg-white p-2.5 rounded-xl border space-y-2 new-author-block relative';
+      d.dataset.idx = idx;
+      d.innerHTML = `
+        <div class="flex gap-1.5 items-center relative">
+          <div class="flex-1 relative">
+            <input type="text" placeholder="作者名稱 *" oninput="handleNewAuthorNameInputLive(this, ${idx})" class="new-b-author-name w-full border rounded-lg px-2.5 py-1 text-xs font-bold" autocomplete="off" />
+            <div class="author-search-dropdown hidden search-dropdown"></div>
+          </div>
+          <button type="button" onclick="removeThisParent(this.parentElement.parentElement)" class="text-red-400 px-1"><i class="fa-solid fa-trash text-xs"></i></button>
+        </div>
+        <div class="space-y-1">
+          <div class="flex justify-between items-center">
+            <span class="text-[10px] text-gray-400">作者鏈結 (可複數)</span>
+            <button type="button" onclick="addNewModalAuthorLink(this)" class="text-[10px] text-[#4A7C6F] font-bold">+ 鏈結</button>
+          </div>
+          <div class="author-links-list space-y-1">
+            <div class="flex gap-1 items-center">
+              <input type="text" placeholder="https://..." class="new-b-author-link flex-1 border rounded px-2 py-0.5 text-[11px]" />
+              <button type="button" onclick="pasteToInput(this)" class="px-1.5 py-0.5 bg-gray-100 rounded text-[10px] font-bold">黏貼</button>
+              <button type="button" onclick="removeThisParent(this)" class="text-red-400 text-[10px] px-0.5"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+          </div>
+        </div>
+      `;
+      list.appendChild(d);
+    }
+
+    function addNewModalAuthorLink(btn) {
+      const list = btn.parentElement.nextElementSibling;
+      if (!list) return;
+      const d = document.createElement('div');
+      d.className = 'flex gap-1 items-center';
+      d.innerHTML = `<input type="text" placeholder="https://..." class="new-b-author-link flex-1 border rounded px-2 py-0.5 text-[11px]" /><button type="button" onclick="pasteToInput(this)" class="px-1.5 py-0.5 bg-gray-100 rounded text-[10px] font-bold">黏貼</button><button type="button" onclick="removeThisParent(this)" class="text-red-400 text-[10px] px-0.5"><i class="fa-solid fa-xmark"></i></button>`;
+      list.appendChild(d);
+    }
+
+    function addNewModalFlyerBlock() {
+      const list = document.getElementById('new-b-flyers-list');
+      if (!list) return;
+      const d = document.createElement('div');
+      d.className = 'bg-white p-2 rounded-lg border space-y-1.5 new-b-flyer-item';
+      d.innerHTML = `
+        <div class="flex items-center gap-2">
+          <div class="w-10 h-10 bg-gray-100 rounded flex items-center justify-center text-[10px] text-gray-400 shrink-0 flyer-thumb-box" data-url="">無圖</div>
+          <div class="flex-1 space-y-1">
+            <div class="flex gap-1">
+              <input type="text" placeholder="連結 URL" class="new-b-flyer-link flex-1 border rounded px-2 py-0.5 text-[11px]" />
+              <button type="button" onclick="pasteToInput(this)" class="px-1.5 py-0.5 bg-gray-100 rounded text-[10px] font-bold">黏貼</button>
+            </div>
+            <div class="flex gap-2">
+              <label class="text-[10px] text-[#4A7C6F] font-bold cursor-pointer underline">選擇圖片<input type="file" accept="image/*" onchange="handleNewModalFlyerFile(event, this)" class="hidden" /></label>
+              <button type="button" onclick="pasteNewModalFlyerImg(this)" class="text-[10px] text-[#4A7C6F] font-bold underline">黏貼圖片</button>
+            </div>
+          </div>
+          <button type="button" onclick="removeThisParent(this.parentElement)" class="text-red-400 text-xs px-1"><i class="fa-solid fa-trash"></i></button>
+        </div>
+      `;
+      list.appendChild(d);
+    }
+
+    async function handleNewModalFlyerFile(e, inp) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const compressed = await externalizeLargeImage(await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.flyer.maxWidth, IMAGE_PRESETS.flyer.quality));
+      const itemBox = inp.closest('.new-b-flyer-item').querySelector('.flyer-thumb-box');
+      itemBox.dataset.url = compressed;
+      itemBox.innerHTML = `<img src="${getImageSrc(compressed)}" class="w-full h-full object-cover rounded" />`;
+    }
+
+    async function pasteNewModalFlyerImg(btn) {
+      try {
+        const compressed = await externalizeLargeImage(await extractCompressedImageFromClipboard(IMAGE_PRESETS.flyer.maxWidth, IMAGE_PRESETS.flyer.quality));
+        if (!compressed) return alert('剪貼板無圖片');
+        const itemBox = btn.closest('.new-b-flyer-item').querySelector('.flyer-thumb-box');
+        itemBox.dataset.url = compressed;
+        itemBox.innerHTML = `<img src="${getImageSrc(compressed)}" class="w-full h-full object-cover rounded" />`;
+      } catch (err) { alert('無法讀取剪貼板'); }
+    }
+
+    async function handleNewBoothMapUpload(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const compressed = await externalizeLargeImage(await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.boothMap.maxWidth, IMAGE_PRESETS.boothMap.quality));
+      tempNewBoothMapData = compressed;
+      document.getElementById('new-b-map-preview').innerHTML = `<img src="${getImageSrc(tempNewBoothMapData)}" class="w-full h-full object-cover" />`;
+    }
+
+    async function pasteNewBoothMap() {
+      try {
+        const compressed = await externalizeLargeImage(await extractCompressedImageFromClipboard(IMAGE_PRESETS.boothMap.maxWidth, IMAGE_PRESETS.boothMap.quality));
+        if (!compressed) return alert('剪貼板無圖片');
+        tempNewBoothMapData = compressed;
+        document.getElementById('new-b-map-preview').innerHTML = `<img src="${getImageSrc(tempNewBoothMapData)}" class="w-full h-full object-cover" />`;
+      } catch (err) { alert('無法讀取剪貼板'); }
+    }
+
+    function createBooth() {
+      const code = document.getElementById('new-b-code').value.trim() || '未編號';
+      const circle = document.getElementById('new-b-circle').value.trim() || '未命名社團';
+      const authorBlocks = document.querySelectorAll('.new-author-block');
+      const authors = Array.from(authorBlocks).map((blk) => {
+        const name = blk.querySelector('.new-b-author-name').value.trim();
+        const links = Array.from(blk.querySelectorAll('.new-b-author-link')).map(i => i.value.trim()).filter(Boolean);
+        return { name, links, sashiire: [], sashiireGiven: {} };
+      }).filter(a => a.name);
+      if (authors.length === 0) return alert('請填寫至少一位作者名稱');
+
+      const flyerItems = document.querySelectorAll('.new-b-flyer-item');
+      const flyerImages = [];
+      flyerItems.forEach(item => {
+        const thumb = item.querySelector('.flyer-thumb-box');
+        const linkInp = item.querySelector('.new-b-flyer-link');
+        const url = (thumb && thumb.dataset.url) || '';
+        const link = (linkInp && linkInp.value.trim()) || '';
+        if (url || link) flyerImages.push({ url, link });
+      });
+
+      const ev = state.events[state.activeEventId];
+      if (!ev.booths) ev.booths = {};
+      const id = 'b_' + Date.now();
+      const order = Object.keys(ev.booths).length + 1;
+      ev.booths[id] = {
+        id, code, circle, authors,
+        boothMapImage: tempNewBoothMapData,
+        flyerImages,
+        order, x: 50, y: 50, items: {}
+      };
+      tempNewBoothMapData = '';
+      closeModal(); saveData(); render();
+    }
+
+    let tempNewItemImageData = '';
+
+    function openNewItemModal(boothId) {
+      const booth = state.events[state.activeEventId].booths[boothId];
+      const authors = getBoothAuthors(booth);
+      const curEv = state.events[state.activeEventId];
+      showModal(`
+        <div class="flex justify-between items-center mb-4">
+          <h3 class="font-bold text-base">新增商品項目</h3>
+          <button onclick="tempNewItemImageData=''; closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="space-y-3 max-h-[75vh] overflow-y-auto pr-1">
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="text-xs text-gray-500">商品名稱 *</label>
+              <input id="it-name" type="text" placeholder="例: 新刊本 / 壓克力立牌" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+            </div>
+            <div>
+              <label class="text-xs text-gray-500">單價 (${curEv.currency || 'JPY'}) (選填)</label>
+              <input id="it-price" type="number" step="${(curEv.currency || 'JPY') === 'JPY' ? '100' : '1'}" placeholder="${(curEv.currency || 'JPY') === 'JPY' ? '例: 500 (選填)' : '選填'}" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+            </div>
+          </div>
+          <div>
+            <label class="text-xs text-gray-500">留貨數量 (預留數量，預設 0)</label>
+            <input id="it-reserve" type="number" min="0" value="0" class="w-full border rounded-xl px-3 py-2 text-sm mt-1 font-bold text-[#4A7C6F]" />
+          </div>
+
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border space-y-1.5">
+            <label class="text-xs font-bold text-gray-700 block">商品創作者 (可多選)</label>
+            <div id="new-item-authors-checkboxes" class="flex flex-wrap gap-1.5 items-center">
+              ${authors.map(a => `
+                <label class="flex items-center gap-1 px-2.5 py-1 rounded border text-xs cursor-pointer bg-white border-gray-200">
+                  <input type="checkbox" value="${a.name}" ${authors.length === 1 ? 'checked' : ''} class="new-item-author-chk w-3.5 h-3.5 accent-[#4A7C6F]" />
+                  <span>${a.name}</span>
+                </label>
+              `).join('')}
+            </div>
+            <div class="relative pt-1 flex gap-1.5 items-center">
+              <div class="relative flex-1">
+                <input type="text" id="new-item-extra-author-input" placeholder="搜尋作者庫或輸入新作者名稱..." oninput="handleNewItemAuthorSearchInputLive(this)" class="w-full border rounded-lg px-2.5 py-1 text-xs" autocomplete="off" />
+                <div class="new-item-author-search-dropdown hidden search-dropdown"></div>
+              </div>
+              <button type="button" onclick="addInstantAuthorToNewItem()" class="px-2.5 py-1 bg-[#4A7C6F] text-white rounded-lg text-xs font-bold shrink-0 shadow-sm">+ 加入</button>
+            </div>
+          </div>
+
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border space-y-1.5">
+            <div class="flex justify-between items-center">
+              <label class="text-xs font-bold text-gray-700">商品連結 URL (可複數)</label>
+              <button type="button" onclick="addNewModalItemLinkInput()" class="text-xs text-[#4A7C6F] font-bold">+ 新增連結</button>
+            </div>
+            <div id="new-modal-item-links-container" class="space-y-1.5">
+              <div class="flex gap-1.5 items-center">
+                <input type="text" placeholder="https://..." class="new-it-link-input flex-1 border rounded-xl px-3 py-1.5 text-xs" />
+                <button type="button" onclick="pasteToInput(this)" class="px-2.5 py-1.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-xl text-xs font-bold">黏貼</button>
+                <button type="button" onclick="removeThisParent(this)" class="text-red-400 px-1"><i class="fa-solid fa-trash text-xs"></i></button>
+              </div>
+            </div>
+          </div>
+
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border">
+            <label class="text-xs font-bold text-gray-700 block mb-1">商品標籤 (以逗號分隔)</label>
+            <input id="it-tags" type="text" placeholder="例如：R-18, 漫畫" class="w-full border rounded-xl px-3 py-1.5 text-xs mb-1.5 bg-white" />
+            <div class="text-[10px] text-gray-400 mb-1">常用標籤點擊快速加入：</div>
+            <div class="flex flex-wrap gap-1">
+              ${getTopTags().map(t => `
+                <button type="button" onclick="appendTagToInput('it-tags', '${t}')" class="px-2 py-0.5 bg-white border border-gray-200 rounded text-[10px] text-gray-600 hover:bg-[#4A7C6F]/10 hover:text-[#4A7C6F]">#${t}</button>
+              `).join('')}
+            </div>
+          </div>
+
+          <div class="bg-[#F9FAF8] p-3 rounded-xl border">
+            <label class="text-xs font-bold text-gray-700 block mb-1.5">商品圖片 (選填)</label>
+            <div class="flex items-center gap-1.5 flex-wrap">
+              <div id="new-it-img-preview" class="w-12 h-12 bg-gray-200/70 rounded-lg flex items-center justify-center text-[10px] text-gray-400 shrink-0 overflow-hidden">
+                ${tempNewItemImageData ? `<img src="${getImageSrc(tempNewItemImageData)}" class="w-full h-full object-cover" />` : '無圖'}
+              </div>
+              <label class="py-2 px-2.5 bg-white border border-gray-300 rounded-lg text-xs font-medium text-gray-700 cursor-pointer">
+                上傳
+                <input type="file" accept="image/*" onchange="handleNewItemImageUpload(event)" class="hidden" />
+              </label>
+              <button type="button" onclick="openCropFromFlyerModal('${boothId}', 'NEW_ITEM', 0, true)" class="py-2 px-2.5 bg-amber-100 text-amber-800 rounded-lg text-xs font-bold">
+                <i class="fa-solid fa-crop-simple mr-1"></i>截取
+              </button>
+              <button type="button" onclick="pasteNewItemImage()" class="py-2 px-2.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-lg text-xs font-bold">黏貼</button>
+            </div>
+          </div>
+
+          <div class="pt-2 border-t">
+            <label class="text-xs font-bold text-gray-700 block mb-2">設定各夥伴需求數量：</label>
+            <div class="space-y-2">
+              ${state.members.map(m => `
+                <div class="flex justify-between items-center bg-gray-50 px-3 py-2 rounded-xl">
+                  <span class="text-sm font-medium">${m}</span>
+                  <input type="number" min="0" value="0" data-member="${m}" class="member-req-input w-20 border rounded-lg px-2 py-1 text-center text-sm font-bold" />
+                </div>
+              `).join('')}
+            </div>
+          </div>
+          <button onclick="createItem('${boothId}')" class="w-full btn-primary py-3 rounded-xl text-sm font-bold mt-2">儲存商品</button>
+        </div>
+      `);
+    }
+
+    function addNewModalItemLinkInput() {
+      const container = document.getElementById('new-modal-item-links-container');
+      if (!container) return;
+      const div = document.createElement('div');
+      div.className = 'flex gap-1.5 items-center';
+      div.innerHTML = `
+        <input type="text" placeholder="https://..." class="new-it-link-input flex-1 border rounded-xl px-3 py-1.5 text-xs" />
+        <button type="button" onclick="pasteToInput(this)" class="px-2.5 py-1.5 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-xl text-xs font-bold">黏貼</button>
+        <button type="button" onclick="removeThisParent(this)" class="text-red-400 px-1"><i class="fa-solid fa-trash text-xs"></i></button>
+      `;
+      container.appendChild(div);
+    }
+
+    async function handleNewItemImageUpload(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const compressed = await externalizeLargeImage(await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.item.maxWidth, IMAGE_PRESETS.item.quality));
+      tempNewItemImageData = compressed;
+      document.getElementById('new-it-img-preview').innerHTML = `<img src="${getImageSrc(tempNewItemImageData)}" class="w-full h-full object-cover" />`;
+    }
+
+    async function pasteNewItemImage() {
+      try {
+        const compressed = await externalizeLargeImage(await extractCompressedImageFromClipboard(IMAGE_PRESETS.item.maxWidth, IMAGE_PRESETS.item.quality));
+        if (!compressed) return alert('剪貼板無圖片');
+        tempNewItemImageData = compressed;
+        document.getElementById('new-it-img-preview').innerHTML = `<img src="${getImageSrc(tempNewItemImageData)}" class="w-full h-full object-cover" />`;
+      } catch (err) { alert('無法讀取剪貼板'); }
+    }
+
+    function createItem(boothId) {
+      const name = document.getElementById('it-name').value.trim();
+      const price = parseFloat(document.getElementById('it-price').value) || 0;
+      const reserve = parseInt(document.getElementById('it-reserve').value) || 0;
+      const tagsRaw = document.getElementById('it-tags').value.trim();
+      if (!name) return alert('請填寫商品名稱');
+      const linkInputs = document.querySelectorAll('.new-it-link-input');
+      const links = Array.from(linkInputs).map(inp => inp.value.trim()).filter(Boolean);
+      const tags = tagsRaw ? tagsRaw.split(',').map(s => s.trim()).filter(Boolean) : [];
+      const authorCheckboxes = document.querySelectorAll('.new-item-author-chk:checked');
+      const chosenAuthors = Array.from(authorCheckboxes).map(c => c.value);
+
+      const orders = {};
+      document.querySelectorAll('.member-req-input').forEach(inp => {
+        const m = inp.dataset.member;
+        const req = parseInt(inp.value) || 0;
+        orders[m] = { req, bought: 0 };
+      });
+      const booth = state.events[state.activeEventId].booths[boothId];
+      if (!booth.items) booth.items = {};
+      const itemId = 'item_' + Date.now();
+      const order = Object.keys(booth.items).length + 1;
+      booth.items[itemId] = {
+        id: itemId, name, price, reserve, links, tags, authors: chosenAuthors,
+        order, status: 'pending', itemImage: tempNewItemImageData, divisionCompleted: false, orders
+      };
+      tempNewItemImageData = '';
+      closeModal(); saveData(); render();
+    }
+
+    function openMapUploadModal() {
+      showModal(`
+        <div class="flex justify-between items-center mb-4">
+          <h3 class="font-bold text-base">上傳展會平面圖</h3>
+          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <p class="text-xs text-gray-500 mb-3">選擇手機相簿中的場地圖，上傳後即可在「跑攤模式」標記各攤位座標位置。</p>
+        <input type="file" accept="image/*" onchange="handleMapUpload(event)" class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-bold file:bg-[#4A7C6F]/10 file:text-[#4A7C6F]" />
+      `);
+    }
+
+    async function handleMapUpload(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      const ev = state.events[state.activeEventId];
+      if (!ev) return;
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMAGE_PRESETS.eventMap.maxWidth, IMAGE_PRESETS.eventMap.quality);
+      ev.mapImage = await externalizeLargeImage(compressed);
+      closeModal();
+      const mapPath = `events/${state.activeEventId}/mapImage`;
+      await saveData(false, mapPath, ev.mapImage);
+    }
+
+    function openMapPinModal(boothId) {
+      const currentEv = state.events[state.activeEventId];
+      if (!getImageSrc(currentEv.mapImage)) return alert('請先在「編輯模式」上傳會場地圖圖片！');
+      const booth = currentEv.booths[boothId];
+      showModal(`
+        <div class="flex justify-between items-center mb-2">
+          <h3 class="font-bold text-sm">點擊地圖標記「${booth.code} ${booth.circle}」位置</h3>
+          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="relative w-full overflow-auto border rounded-xl bg-gray-100" style="max-height: 60vh;">
+          <img id="pin-map-img" src="${getImageSrc(currentEv.mapImage)}" class="w-full h-auto block cursor-crosshair" onclick="setBoothPin(event, '${boothId}')" />
+          <div style="left: ${booth.x || 50}%; top: ${booth.y || 50}%;" class="absolute -translate-x-1/2 -translate-y-1/2 w-4 h-4 bg-[#D96B43] rounded-full ring-4 ring-white shadow-lg pointer-events-none"></div>
+        </div>
+      `);
+    }
+
+    function setBoothPin(e, boothId) {
+      const rect = e.target.getBoundingClientRect();
+      const xPct = Math.round(((e.clientX - rect.left) / rect.width) * 100);
+      const yPct = Math.round(((e.clientY - rect.top) / rect.height) * 100);
+      const booth = state.events[state.activeEventId].booths[boothId];
+      booth.x = xPct; booth.y = yPct;
+      closeModal();
+      const boothPath = `events/${state.activeEventId}/booths/${boothId}`;
+      saveData(false, boothPath, booth);
+    }
+
+    function openNewFavModal() {
+      showModal(`
+        <div class="flex justify-between items-center mb-4">
+          <h3 class="font-bold text-base">新增常用關注作者</h3>
+          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="space-y-3">
+          <input id="fav-circle" type="text" placeholder="社團名稱 *" class="w-full border rounded-xl px-3 py-2 text-sm" />
+          <input id="fav-author" type="text" placeholder="作者名字 *" class="w-full border rounded-xl px-3 py-2 text-sm" />
+          <input id="fav-link" type="text" placeholder="主頁網址 (X / Pixiv)" class="w-full border rounded-xl px-3 py-2 text-sm" />
+          <button onclick="createFav()" class="w-full btn-primary py-3 rounded-xl text-sm font-bold">加入收藏庫</button>
+        </div>
+      `);
+    }
+
+    function createFav() {
+      const circle = document.getElementById('fav-circle').value.trim();
+      const author = document.getElementById('fav-author').value.trim();
+      const link = document.getElementById('fav-link').value.trim();
+      if (!circle || !author) return alert('請填寫社團與作者名稱');
+      state.favorites.push({ id: 'fav_' + Date.now(), circle, author, link, isStarred: true });
+      closeModal(); saveData(); render();
+    }
+
+    const manifest = {
+      name: "場販計劃 - 同人展多人共編清單", short_name: "場販計劃",
+      start_url: ".", display: "standalone", background_color: "#F4F5F0", theme_color: "#4A7C6F",
+      icons: [{ src: "https://cdn-icons-png.flaticon.com/512/3144/3144456.png", sizes: "512x512", type: "image/png" }]
+    };
+    const stringManifest = JSON.stringify(manifest);
+    const blob = new Blob([stringManifest], {type: 'application/json'});
+    document.getElementById('manifest-placeholder').setAttribute('href', URL.createObjectURL(blob));
+
+    initData();
+  </script>
+</body>
+</html>
