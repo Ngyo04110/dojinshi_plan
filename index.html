@@ -149,6 +149,66 @@
     let isFirebaseConnected = false;
     let uploadSequence = 0;
 
+    // 新增：雲端載入完成鎖與雲端資料統計，防止未載入完成或空資料覆蓋雲端
+    let hasCloudInitialLoadCompleted = false;
+    let lastKnownCloudStats = { eventsCount: 0, boothsCount: 0 };
+
+    function countDataStats(dataObj) {
+      if (!dataObj || !dataObj.events || typeof dataObj.events !== 'object') {
+        return { eventsCount: 0, boothsCount: 0 };
+      }
+      const evValues = Object.values(dataObj.events);
+      let boothsCount = 0;
+      evValues.forEach(ev => {
+        if (ev && ev.booths && typeof ev.booths === 'object') {
+          boothsCount += Object.keys(ev.booths).length;
+        }
+      });
+      return { eventsCount: evValues.length, boothsCount };
+    }
+
+    function updateManualSyncButtonState() {
+      const btn = document.getElementById('btn-manual-sync');
+      if (!btn) return;
+      if (useFirebase && !hasCloudInitialLoadCompleted) {
+        btn.disabled = true;
+        btn.classList.add('opacity-50', 'cursor-not-allowed');
+        btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1 text-gray-400"></i>等待雲端載入`;
+      } else {
+        btn.disabled = false;
+        btn.classList.remove('opacity-50', 'cursor-not-allowed');
+        btn.innerHTML = `<i class="fa-solid fa-rotate mr-1 text-[#4A7C6F]"></i>重連並儲存`;
+      }
+    }
+
+    function forcePullFromCloud() {
+      if (!useFirebase || !db) return alert('目前為單機模式，無雲端資料可下載。');
+      if (!confirm('確定要放棄本地未同步的變更，直接從雲端重新下載最新資料嗎？')) return;
+      setLoadingOverlay(true, '正在從雲端重新下載資料...');
+      db.ref('doujinPlanner').once('value')
+        .then((snapshot) => {
+          setLoadingOverlay(false);
+          const val = snapshot.val();
+          if (val) {
+            hasPendingLocalChanges = false;
+            safeSetStorage(LOCAL_PENDING_KEY, 'false');
+            applyLoadedData(val);
+            lastKnownCloudStats = countDataStats(val);
+            persistStateLocally(false);
+            hasCloudInitialLoadCompleted = true;
+            updateManualSyncButtonState();
+            updateSyncBadge('synced', '已從雲端還原');
+            render();
+          } else {
+            alert('雲端目前沒有任何資料。');
+          }
+        })
+        .catch((err) => {
+          setLoadingOverlay(false);
+          alert('從雲端下載失敗，請檢查網路連線：' + err.message);
+        });
+    }
+
     function setLoadingOverlay(visible, text = '正在載入資料...') {
       const overlay = document.getElementById('loading-overlay');
       const textEl = document.getElementById('loading-overlay-text');
@@ -353,6 +413,8 @@
 
     function initData() {
       setLoadingOverlay(true, '正在載入資料...');
+      updateManualSyncButtonState();
+
       const savedLastTime = safeGetStorage(LOCAL_LAST_SAVED_KEY);
       if (savedLastTime) updateLastSavedDisplay(savedLastTime);
 
@@ -366,6 +428,7 @@
           applyLoadedData(parsed);
           hasLocalCache = true;
           render();
+          // 若有本地快取，先顯示畫面但保持 hasCloudInitialLoadCompleted = false，直到雲端回應確認
           setLoadingOverlay(false);
         } catch (e) {
           console.warn('本地快取解析失敗:', e);
@@ -376,9 +439,9 @@
         db.ref('.info/connected').on('value', (snap) => {
           isFirebaseConnected = snap.val() === true;
           if (isFirebaseConnected) {
-            if (hasPendingLocalChanges) {
+            if (hasCloudInitialLoadCompleted && hasPendingLocalChanges) {
               syncToCloudIfNeeded(false);
-            } else if (!isUploadingToCloud) {
+            } else if (!isUploadingToCloud && hasCloudInitialLoadCompleted) {
               updateSyncBadge('synced', '已連線');
             }
           } else {
@@ -388,25 +451,38 @@
 
         db.ref('doujinPlanner').on('value', (snapshot) => {
           setLoadingOverlay(false);
+          const val = snapshot.val();
+          const cloudStats = countDataStats(val);
+          if (cloudStats.eventsCount > 0 || cloudStats.boothsCount > 0) {
+            lastKnownCloudStats = cloudStats;
+          }
+
+          // 首次從雲端取得回應，解除寫入鎖定
+          const isFirstCloudResponse = !hasCloudInitialLoadCompleted;
+          hasCloudInitialLoadCompleted = true;
+          updateManualSyncButtonState();
+
           if (isUploadingToCloud || hasPendingLocalChanges) {
+            // 若本地有待同步修改，確認非空資料後才同步
             syncToCloudIfNeeded(false);
             return;
           }
-          const val = snapshot.val();
+
           if (val) {
             applyLoadedData(val);
             persistStateLocally(false);
-          } else if (!hasLocalCache) {
+            updateSyncBadge('synced', '已連線');
+          } else if (!hasLocalCache && isFirstCloudResponse) {
+            // 僅在確認雲端與本地皆完全無資料時才建立初始資料
             seedInitialData();
           }
           render();
         }, (err) => {
-          console.warn('雲端監聽異常，使用本地資料:', err);
+          console.warn('雲端監聽異常，暫停雲端覆蓋保護資料:', err);
           setLoadingOverlay(false);
-          if (!hasLocalCache) {
-            seedInitialData();
-          }
-          updateSyncBadge('error', '離線暫存中');
+          // 發生錯誤時不解除雲端寫入鎖，避免異常空狀態覆蓋雲端
+          updateManualSyncButtonState();
+          updateSyncBadge('error', '連線異常 · 唯讀保護中');
           render();
         });
 
@@ -414,23 +490,24 @@
           const overlay = document.getElementById('loading-overlay');
           if (overlay && !overlay.classList.contains('hidden')) {
             setLoadingOverlay(false);
-            if (!hasLocalCache && Object.keys(state.events || {}).length === 0) {
-              seedInitialData();
-            }
-            updateSyncBadge('error', '連線較慢 · 本地運作中');
+            // 逾時未載入完成時，絕不呼叫 seedInitialData() 寫入雲端，保持唯讀保護
+            updateSyncBadge('error', '連線逾時 · 已鎖定防覆蓋');
             render();
           }
-        }, 3500);
+        }, 4000);
 
         setInterval(() => {
           if (useFirebase && db) {
             if (!isFirebaseConnected) {
               try { db.goOnline(); } catch (e) {}
             }
-            syncToCloudIfNeeded(false);
+            if (hasCloudInitialLoadCompleted) {
+              syncToCloudIfNeeded(false);
+            }
           }
         }, 6000);
       } else {
+        hasCloudInitialLoadCompleted = true;
         setLoadingOverlay(false);
         updateSyncBadge('offline');
         if (!hasLocalCache) seedInitialData();
@@ -444,6 +521,7 @@
 
     function saveData() {
       persistStateLocally(true);
+      render(); // 確保所有狀態變更（包含預覽大小、數量增減）立即刷新畫面
       if (useFirebase && db) {
         updateSyncBadge('pending', '本地已存 · 同步中');
         syncToCloudIfNeeded(false);
@@ -451,16 +529,21 @@
         const nowStr = formatClockTime();
         safeSetStorage(LOCAL_LAST_SAVED_KEY, nowStr);
         updateLastSavedDisplay(nowStr + ' (本地)');
-        render();
       }
     }
 
-    function syncToCloudIfNeeded(forceSync = false) {
+    function syncToCloudIfNeeded(forceSync = false, allowEmptyOverwrite = false) {
       if (!useFirebase || !db) {
         persistStateLocally(false);
         const nowStr = formatClockTime();
         updateLastSavedDisplay(nowStr + ' (本地)');
         updateSyncBadge('offline');
+        return;
+      }
+
+      // 防護 1：尚未完成雲端初次讀取前，禁止寫入雲端
+      if (!hasCloudInitialLoadCompleted) {
+        updateSyncBadge('pending', '等待雲端載入完成...');
         return;
       }
 
@@ -470,11 +553,30 @@
         return;
       }
 
+      const payload = getPersistablePayload();
+      const localStats = countDataStats(payload);
+
+      // 防護 2：若雲端原本有資料，而本地準備上傳的資料變成「0 活動或 0 攤位」，自動攔截防止覆蓋
+      if (!allowEmptyOverwrite && (lastKnownCloudStats.eventsCount > 0 || lastKnownCloudStats.boothsCount > 0)) {
+        if (localStats.eventsCount === 0 || (lastKnownCloudStats.boothsCount > 0 && localStats.boothsCount === 0)) {
+          updateSyncBadge('error', '已攔截空資料覆蓋');
+          const shouldForce = confirm(
+            `【⚠️ 防資料遺失保護】\n\n` +
+            `偵測到目前畫面沒有任何攤位或活動（雲端原本有 ${lastKnownCloudStats.eventsCount} 個活動、${lastKnownCloudStats.boothsCount} 個攤位）。\n\n` +
+            `系統已自動阻止覆蓋雲端資料！\n` +
+            `• 按「取消」：保留雲端資料並重新從雲端下載\n` +
+            `• 按「確定」：確認你真的要清空雲端所有資料`
+          );
+          if (!shouldForce) {
+            forcePullFromCloud();
+            return;
+          }
+        }
+      }
+
       isUploadingToCloud = true;
       const currentSeq = ++uploadSequence;
       updateSyncBadge('uploading', '同步雲端中...');
-
-      const payload = getPersistablePayload();
 
       const safetyTimer = setTimeout(() => {
         if (isUploadingToCloud && currentSeq === uploadSequence) {
@@ -487,6 +589,7 @@
         .then(() => {
           clearTimeout(safetyTimer);
           isUploadingToCloud = false;
+          lastKnownCloudStats = localStats;
           if (currentSeq === uploadSequence) {
             hasPendingLocalChanges = false;
             safeSetStorage(LOCAL_PENDING_KEY, 'false');
@@ -495,7 +598,7 @@
             updateLastSavedDisplay(nowStr);
             updateSyncBadge('synced', '已連線 · 已儲存');
           } else {
-            syncToCloudIfNeeded(false);
+            syncToCloudIfNeeded(false, allowEmptyOverwrite);
           }
         })
         .catch((err) => {
@@ -1156,8 +1259,17 @@
       }
     }
 
-    function setItemImageMode(mode) { state.itemImageMode = mode; saveData(); }
-    function setRunImageMode(mode) { state.runImageMode = mode; saveData(); }
+    function setItemImageMode(mode) {
+      state.itemImageMode = mode;
+      render();
+      saveData();
+    }
+
+    function setRunImageMode(mode) {
+      state.runImageMode = mode;
+      render();
+      saveData();
+    }
 
     function changeEditSortMode(val) {
       state.sortMode = val;
