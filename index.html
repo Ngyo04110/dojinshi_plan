@@ -149,22 +149,65 @@
     let isFirebaseConnected = false;
     let uploadSequence = 0;
 
-    // 新增：雲端載入完成鎖與雲端資料統計，防止未載入完成或空資料覆蓋雲端
+    // 雲端載入完成鎖與雲端資料統計，防止未載入完成或空資料覆蓋雲端
     let hasCloudInitialLoadCompleted = false;
     let lastKnownCloudStats = { eventsCount: 0, boothsCount: 0 };
 
+    const LOCAL_CLOUD_STATS_KEY = 'doujin_planner_last_cloud_stats_v2';
+    const LOCAL_CLOUD_SNAPSHOT_KEY = 'doujin_planner_last_cloud_snapshot_v2';
+
     function countDataStats(dataObj) {
       if (!dataObj || !dataObj.events || typeof dataObj.events !== 'object') {
-        return { eventsCount: 0, boothsCount: 0 };
+        return { eventsCount: 0, boothsCount: 0, itemsCount: 0 };
       }
-      const evValues = Object.values(dataObj.events);
+      const evValues = Object.values(dataObj.events).filter(Boolean);
       let boothsCount = 0;
+      let itemsCount = 0;
       evValues.forEach(ev => {
         if (ev && ev.booths && typeof ev.booths === 'object') {
-          boothsCount += Object.keys(ev.booths).length;
+          const bList = Object.values(ev.booths).filter(Boolean);
+          boothsCount += bList.length;
+          bList.forEach(b => {
+            if (b && b.items && typeof b.items === 'object') {
+              itemsCount += Object.values(b.items).filter(Boolean).length;
+            }
+          });
         }
       });
-      return { eventsCount: evValues.length, boothsCount };
+      return { eventsCount: evValues.length, boothsCount, itemsCount };
+    }
+
+    function saveKnownCloudStats(stats) {
+      if (!stats) return;
+      lastKnownCloudStats = {
+        eventsCount: stats.eventsCount || 0,
+        boothsCount: stats.boothsCount || 0,
+        itemsCount: stats.itemsCount || 0
+      };
+      safeSetStorage(LOCAL_CLOUD_STATS_KEY, JSON.stringify(lastKnownCloudStats));
+    }
+
+    function loadKnownCloudStats() {
+      const raw = safeGetStorage(LOCAL_CLOUD_STATS_KEY);
+      if (!raw) return;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          lastKnownCloudStats = {
+            eventsCount: parsed.eventsCount || 0,
+            boothsCount: parsed.boothsCount || 0,
+            itemsCount: parsed.itemsCount || 0
+          };
+        }
+      } catch (e) {}
+    }
+
+    function hasAnyMeaningfulData(payload) {
+      if (!payload || typeof payload !== 'object') return false;
+      const stats = countDataStats(payload);
+      if (stats.eventsCount > 0 || stats.boothsCount > 0 || stats.itemsCount > 0) return true;
+      if (Array.isArray(payload.favorites) && payload.favorites.length > 0) return true;
+      return false;
     }
 
     function updateManualSyncButtonState() {
@@ -189,18 +232,19 @@
         .then((snapshot) => {
           setLoadingOverlay(false);
           const val = snapshot.val();
-          if (val) {
+          if (val && hasAnyMeaningfulData(val)) {
             hasPendingLocalChanges = false;
             safeSetStorage(LOCAL_PENDING_KEY, 'false');
             applyLoadedData(val);
-            lastKnownCloudStats = countDataStats(val);
+            saveKnownCloudStats(countDataStats(val));
+            safeSetStorage(LOCAL_CLOUD_SNAPSHOT_KEY, JSON.stringify(sanitizeForFirebase(val)));
             persistStateLocally(false);
             hasCloudInitialLoadCompleted = true;
             updateManualSyncButtonState();
             updateSyncBadge('synced', '已從雲端還原');
             render();
           } else {
-            alert('雲端目前沒有任何資料。');
+            alert('雲端目前沒有任何有效資料，已保留目前本地資料。');
           }
         })
         .catch((err) => {
@@ -303,15 +347,19 @@
       if (document.visibilityState === 'hidden') {
         persistStateLocally(hasPendingLocalChanges);
       } else if (document.visibilityState === 'visible' && useFirebase && db) {
-        db.goOnline();
-        syncToCloudIfNeeded(false);
+        try { db.goOnline(); } catch (e) {}
+        if (hasCloudInitialLoadCompleted) {
+          syncToCloudIfNeeded(false);
+        }
       }
     });
 
     window.addEventListener('online', () => {
       if (useFirebase && db) {
-        db.goOnline();
-        syncToCloudIfNeeded(false);
+        try { db.goOnline(); } catch (e) {}
+        if (hasCloudInitialLoadCompleted) {
+          syncToCloudIfNeeded(false);
+        }
       }
     });
 
@@ -371,7 +419,12 @@
 
     function persistStateLocally(markPending = true) {
       const payload = getPersistablePayload();
-      safeSetStorage(LOCAL_STATE_KEY, JSON.stringify(payload));
+      const serialized = JSON.stringify(payload);
+      safeSetStorage(LOCAL_STATE_KEY, serialized);
+      // 同時保留一份最新有效狀態備份，防止意外清空
+      if (hasAnyMeaningfulData(payload)) {
+        safeSetStorage('doujin_planner_backup', serialized);
+      }
       if (markPending) {
         hasPendingLocalChanges = true;
         safeSetStorage(LOCAL_PENDING_KEY, 'true');
@@ -413,6 +466,7 @@
 
     function initData() {
       setLoadingOverlay(true, '正在載入資料...');
+      loadKnownCloudStats();
       updateManualSyncButtonState();
 
       const savedLastTime = safeGetStorage(LOCAL_LAST_SAVED_KEY);
@@ -421,15 +475,23 @@
       const cachedRaw = safeGetStorage(LOCAL_STATE_KEY) || safeGetStorage('doujin_planner_backup') || safeGetStorage('doujin_planner_demo');
       hasPendingLocalChanges = safeGetStorage(LOCAL_PENDING_KEY) === 'true';
       let hasLocalCache = false;
+      let localCacheMeaningful = false;
 
       if (cachedRaw) {
         try {
           const parsed = JSON.parse(cachedRaw);
-          applyLoadedData(parsed);
-          hasLocalCache = true;
-          render();
-          // 若有本地快取，先顯示畫面但保持 hasCloudInitialLoadCompleted = false，直到雲端回應確認
-          setLoadingOverlay(false);
+          if (parsed && typeof parsed === 'object') {
+            applyLoadedData(parsed);
+            hasLocalCache = true;
+            localCacheMeaningful = hasAnyMeaningfulData(parsed);
+            const localStats = countDataStats(parsed);
+            if (localStats.eventsCount > lastKnownCloudStats.eventsCount || localStats.boothsCount > lastKnownCloudStats.boothsCount) {
+              saveKnownCloudStats(localStats);
+            }
+            render();
+            // 若有本地快取，先顯示畫面但保持 hasCloudInitialLoadCompleted = false，直到雲端回應確認
+            setLoadingOverlay(false);
+          }
         } catch (e) {
           console.warn('本地快取解析失敗:', e);
         }
@@ -442,7 +504,7 @@
             if (hasCloudInitialLoadCompleted && hasPendingLocalChanges) {
               syncToCloudIfNeeded(false);
             } else if (!isUploadingToCloud && hasCloudInitialLoadCompleted) {
-              updateSyncBadge('synced', '已連線');
+              updateSyncBadge('synced', hasPendingLocalChanges ? '已連線 · 待同步' : '已連線');
             }
           } else {
             updateSyncBadge('error', hasPendingLocalChanges ? '離線（待同步）' : '離線暫存中');
@@ -452,9 +514,12 @@
         db.ref('doujinPlanner').on('value', (snapshot) => {
           setLoadingOverlay(false);
           const val = snapshot.val();
+          const cloudMeaningful = hasAnyMeaningfulData(val);
           const cloudStats = countDataStats(val);
-          if (cloudStats.eventsCount > 0 || cloudStats.boothsCount > 0) {
-            lastKnownCloudStats = cloudStats;
+
+          if (cloudMeaningful) {
+            saveKnownCloudStats(cloudStats);
+            safeSetStorage(LOCAL_CLOUD_SNAPSHOT_KEY, JSON.stringify(sanitizeForFirebase(val)));
           }
 
           // 首次從雲端取得回應，解除寫入鎖定
@@ -462,25 +527,61 @@
           hasCloudInitialLoadCompleted = true;
           updateManualSyncButtonState();
 
-          if (isUploadingToCloud || hasPendingLocalChanges) {
-            // 若本地有待同步修改，確認非空資料後才同步
-            syncToCloudIfNeeded(false);
+          if (isUploadingToCloud) {
             return;
           }
 
-          if (val) {
+          // 若本地有待同步變更：
+          // 1) 若雲端有有效資料且比本地更完整（例如重開機／跨裝置剛更新），優先合併或保留有效資料，避免空本地覆蓋雲端
+          if (hasPendingLocalChanges) {
+            const currentPayload = getPersistablePayload();
+            const currentStats = countDataStats(currentPayload);
+            if (!hasAnyMeaningfulData(currentPayload) && cloudMeaningful) {
+              // 本地目前為空但雲端有資料：直接套用雲端資料並清除錯誤的待同步旗標
+              hasPendingLocalChanges = false;
+              safeSetStorage(LOCAL_PENDING_KEY, 'false');
+              applyLoadedData(val);
+              persistStateLocally(false);
+              updateSyncBadge('synced', '已同步雲端資料');
+              render();
+              return;
+            }
+            // 若本地有實際變更且有效，推播到雲端
+            if (hasAnyMeaningfulData(currentPayload)) {
+              syncToCloudIfNeeded(false);
+              return;
+            }
+          }
+
+          if (cloudMeaningful) {
             applyLoadedData(val);
             persistStateLocally(false);
             updateSyncBadge('synced', '已連線');
-          } else if (!hasLocalCache && isFirstCloudResponse) {
+          } else if (!hasLocalCache && !localCacheMeaningful && isFirstCloudResponse) {
             // 僅在確認雲端與本地皆完全無資料時才建立初始資料
             seedInitialData();
+          } else if (!cloudMeaningful && (localCacheMeaningful || lastKnownCloudStats.eventsCount > 0 || lastKnownCloudStats.boothsCount > 0)) {
+            // 雲端突然變為空資料，但本地/歷史紀錄曾有資料：不覆蓋本地，並嘗試從備份或阻止空覆蓋
+            const backupRaw = safeGetStorage(LOCAL_CLOUD_SNAPSHOT_KEY) || safeGetStorage('doujin_planner_backup');
+            if (!hasAnyMeaningfulData(getPersistablePayload()) && backupRaw) {
+              try {
+                const backupObj = JSON.parse(backupRaw);
+                if (hasAnyMeaningfulData(backupObj)) {
+                  applyLoadedData(backupObj);
+                  hasPendingLocalChanges = true;
+                  safeSetStorage(LOCAL_PENDING_KEY, 'true');
+                  updateSyncBadge('pending', '已從備份還原 · 待同步');
+                  render();
+                  return;
+                }
+              } catch (e) {}
+            }
+            updateSyncBadge('error', '雲端為空 · 已保護本地資料');
           }
           render();
         }, (err) => {
           console.warn('雲端監聽異常，暫停雲端覆蓋保護資料:', err);
           setLoadingOverlay(false);
-          // 發生錯誤時不解除雲端寫入鎖，避免異常空狀態覆蓋雲端
           updateManualSyncButtonState();
           updateSyncBadge('error', '連線異常 · 唯讀保護中');
           render();
@@ -501,7 +602,7 @@
             if (!isFirebaseConnected) {
               try { db.goOnline(); } catch (e) {}
             }
-            if (hasCloudInitialLoadCompleted) {
+            if (hasCloudInitialLoadCompleted && hasPendingLocalChanges && !isUploadingToCloud) {
               syncToCloudIfNeeded(false);
             }
           }
@@ -556,7 +657,7 @@
       const payload = getPersistablePayload();
       const localStats = countDataStats(payload);
 
-      // 防護 2：若雲端原本有資料，而本地準備上傳的資料變成「0 活動或 0 攤位」，自動攔截防止覆蓋
+      // 防護 2：若雲端/歷史紀錄原本有資料，而本地準備上傳的資料變成「0 活動或 0 攤位」，自動攔截防止覆蓋
       if (!allowEmptyOverwrite && (lastKnownCloudStats.eventsCount > 0 || lastKnownCloudStats.boothsCount > 0)) {
         if (localStats.eventsCount === 0 || (lastKnownCloudStats.boothsCount > 0 && localStats.boothsCount === 0)) {
           updateSyncBadge('error', '已攔截空資料覆蓋');
@@ -578,18 +679,32 @@
       const currentSeq = ++uploadSequence;
       updateSyncBadge('uploading', '同步雲端中...');
 
+      // 縮短 safetyTimer 至 5 秒，避免卡住後長期顯示「等待下次重試」
       const safetyTimer = setTimeout(() => {
         if (isUploadingToCloud && currentSeq === uploadSequence) {
           isUploadingToCloud = false;
-          updateSyncBadge('pending', '等待下次重試');
+          hasPendingLocalChanges = true;
+          safeSetStorage(LOCAL_PENDING_KEY, 'true');
+          try {
+            db.goOffline();
+            db.goOnline();
+          } catch (e) {}
+          updateSyncBadge('pending', '連線逾時 · 準備重試');
         }
-      }, 10000);
+      }, 5000);
 
-      db.ref('doujinPlanner').set(payload)
+      // 加上 8 秒寫入逾時 Promise race，確保行動網路卡頓時不會無限掛起
+      const setPromise = db.ref('doujinPlanner').set(payload);
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('雲端寫入逾時')), 8000);
+      });
+
+      Promise.race([setPromise, timeoutPromise])
         .then(() => {
           clearTimeout(safetyTimer);
           isUploadingToCloud = false;
-          lastKnownCloudStats = localStats;
+          saveKnownCloudStats(localStats);
+          safeSetStorage(LOCAL_CLOUD_SNAPSHOT_KEY, JSON.stringify(payload));
           if (currentSeq === uploadSequence) {
             hasPendingLocalChanges = false;
             safeSetStorage(LOCAL_PENDING_KEY, 'false');
