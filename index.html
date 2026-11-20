@@ -130,9 +130,46 @@
     const LOCAL_STATE_KEY = 'doujin_planner_local_state_v3';
     const LOCAL_PENDING_KEY = 'doujin_planner_pending_sync_v3';
     const LOCAL_PENDING_TS_KEY = 'doujin_planner_pending_ts_v3';
+    const LOCAL_PENDING_PATCHES_KEY = 'doujin_planner_pending_patches_v3';
     const LOCAL_LAST_SAVED_KEY = 'doujin_planner_last_saved_v3';
     const LOCAL_CLOUD_STATS_KEY = 'doujin_planner_last_cloud_stats_v3';
     const LOCAL_CLOUD_SNAPSHOT_KEY = 'doujin_planner_last_cloud_snapshot_v3';
+
+    // 圖片壓縮規格（降低單張 Base64 體積，加速行動網路傳輸）
+    const IMG_PRESET = {
+      item: { maxWidth: 480, quality: 0.68 },
+      boothMap: { maxWidth: 480, quality: 0.68 },
+      flyer: { maxWidth: 720, quality: 0.65 },
+      hallMap: { maxWidth: 900, quality: 0.65 }
+    };
+
+    // 增量更新佇列：key 為 Firebase 路徑，value 為要更新的值
+    let pendingPatchMap = {};
+    let needsFullSync = false;
+
+    async function loadPendingPatches() {
+      try {
+        const raw = await AppLocalDB.get(LOCAL_PENDING_PATCHES_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') {
+            pendingPatchMap = parsed.patches || {};
+            needsFullSync = !!parsed.needsFullSync;
+          }
+        }
+      } catch (e) {
+        pendingPatchMap = {};
+      }
+    }
+
+    async function savePendingPatches() {
+      try {
+        await AppLocalDB.set(LOCAL_PENDING_PATCHES_KEY, JSON.stringify({
+          patches: pendingPatchMap,
+          needsFullSync
+        }));
+      } catch (e) {}
+    }
 
     // 大容量 IndexedDB 封裝（徹底解決手機貼圖超過 localStorage 5MB 上限導致殘留舊快取的問題）
     const AppLocalDB = {
@@ -299,11 +336,14 @@
       return false;
     }
 
-    function clearPendingFlag() {
+    async function clearPendingFlag() {
       hasPendingLocalChanges = false;
       localPendingTimestamp = 0;
+      pendingPatchMap = {};
+      needsFullSync = false;
       safeSetStorage(LOCAL_PENDING_KEY, 'false');
       safeSetStorage(LOCAL_PENDING_TS_KEY, '0');
+      await savePendingPatches();
     }
 
     function updateManualSyncButtonState() {
@@ -395,7 +435,7 @@
     }
 
     // 統一圖片壓縮工具（支援 DataURL、File、Clipboard Blob）
-    function compressImageDataUrl(dataUrl, maxWidth = 720, quality = 0.72) {
+    function compressImageDataUrl(dataUrl, maxWidth = 480, quality = 0.68) {
       return new Promise((resolve) => {
         if (!dataUrl || !dataUrl.startsWith('data:image/')) {
           resolve(dataUrl);
@@ -426,7 +466,7 @@
       });
     }
 
-    function readBlobOrFileAsCompressedDataUrl(fileOrBlob, maxWidth = 720, quality = 0.72) {
+    function readBlobOrFileAsCompressedDataUrl(fileOrBlob, maxWidth = 480, quality = 0.68) {
       return new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = async (evt) => {
@@ -580,7 +620,8 @@
         || safeGetStorage('doujin_planner_local_state_v2')
         || safeGetStorage('doujin_planner_backup');
 
-      hasPendingLocalChanges = safeGetStorage(LOCAL_PENDING_KEY) === 'true';
+      await loadPendingPatches();
+      hasPendingLocalChanges = safeGetStorage(LOCAL_PENDING_KEY) === 'true' || Object.keys(pendingPatchMap).length > 0;
       localPendingTimestamp = Number(safeGetStorage(LOCAL_PENDING_TS_KEY)) || 0;
       let hasLocalCache = false;
       let localCacheMeaningful = false;
@@ -739,16 +780,47 @@
       return JSON.parse(JSON.stringify(obj, (k, v) => v === undefined ? null : v));
     }
 
+    // 局部路徑增量儲存（專用於圖片上傳、裁切、單一欄位更新，避免整包重傳）
+    async function savePatchData(patchPathsObj) {
+      localStateUpdatedAt = Date.now();
+      const payloadCheck = getPersistablePayload(localStateUpdatedAt);
+      const meaningful = hasAnyMeaningfulData(payloadCheck);
+      render();
+
+      Object.entries(patchPathsObj || {}).forEach(([path, val]) => {
+        pendingPatchMap[path] = val === undefined ? null : val;
+      });
+      pendingPatchMap['doujinPlanner/updatedAt'] = localStateUpdatedAt;
+
+      const savedOk = await persistStateLocally(meaningful);
+      if (savedOk) {
+        await savePendingPatches();
+      }
+
+      if (useFirebase && db) {
+        updateSyncBadge('pending', '本地已存 · 同步圖片中');
+        syncToCloudIfNeeded(false, false);
+      } else {
+        const nowStr = formatClockTime();
+        safeSetStorage(LOCAL_LAST_SAVED_KEY, nowStr);
+        updateLastSavedDisplay(nowStr + ' (本地)');
+      }
+    }
+
     async function saveData(allowEmptyOverwrite = false) {
       localStateUpdatedAt = Date.now();
       const payloadCheck = getPersistablePayload(localStateUpdatedAt);
       const meaningful = hasAnyMeaningfulData(payloadCheck);
       render();
-      await persistStateLocally(meaningful || allowEmptyOverwrite);
+      needsFullSync = true;
+      const savedOk = await persistStateLocally(meaningful || allowEmptyOverwrite);
+      if (savedOk) {
+        await savePendingPatches();
+      }
 
       if (useFirebase && db) {
         if (!meaningful && !allowEmptyOverwrite) {
-          clearPendingFlag();
+          await clearPendingFlag();
           updateSyncBadge('error', '本地為空 · 已禁止寫入雲端');
           return;
         }
@@ -776,13 +848,15 @@
       }
 
       if (isUploadingToCloud) return;
-      if (!forceSync && !hasPendingLocalChanges) {
+      const patchKeys = Object.keys(pendingPatchMap);
+      if (!forceSync && !hasPendingLocalChanges && patchKeys.length === 0) {
         if (isFirebaseConnected) updateSyncBadge('synced', '已連線');
         return;
       }
 
       if (forceSync) {
         localStateUpdatedAt = Date.now();
+        needsFullSync = true;
       }
       const payload = getPersistablePayload(localStateUpdatedAt);
       const localStats = countDataStats(payload);
@@ -793,7 +867,10 @@
         return;
       }
 
-      if (!allowEmptyOverwrite && (lastKnownCloudStats.eventsCount > 0 || lastKnownCloudStats.boothsCount > 0)) {
+      const useIncrementalPatch = !forceSync && !needsFullSync && !allowEmptyOverwrite && patchKeys.length > 0;
+      const batchSnapshot = useIncrementalPatch ? { ...pendingPatchMap } : null;
+
+      if (!useIncrementalPatch && !allowEmptyOverwrite && (lastKnownCloudStats.eventsCount > 0 || lastKnownCloudStats.boothsCount > 0)) {
         if (localStats.eventsCount === 0 || (lastKnownCloudStats.boothsCount > 0 && localStats.boothsCount === 0)) {
           clearPendingFlag();
           updateSyncBadge('error', '已攔截空資料覆蓋');
@@ -813,21 +890,33 @@
 
       isUploadingToCloud = true;
       const currentSeq = ++uploadSequence;
-      updateSyncBadge('uploading', '同步雲端中...');
+      updateSyncBadge('uploading', useIncrementalPatch ? '增量上傳中...' : '同步雲端中...');
 
-      // 給予行動網路充足的上傳時間（25 秒），避免大圖上傳到一半被提早切斷而留下假性待重試旗標
-      const setPromise = db.ref('doujinPlanner').set(payload);
+      const writePromise = useIncrementalPatch
+        ? db.ref().update(sanitizeForFirebase(batchSnapshot))
+        : db.ref('doujinPlanner').set(payload);
+
       const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('雲端寫入逾時')), 25000);
+        setTimeout(() => reject(new Error('雲端寫入逾時')), 20000);
       });
 
-      Promise.race([setPromise, timeoutPromise])
+      Promise.race([writePromise, timeoutPromise])
         .then(async () => {
           isUploadingToCloud = false;
           saveKnownCloudStats(localStats);
           await AppLocalDB.set(LOCAL_CLOUD_SNAPSHOT_KEY, JSON.stringify(payload));
-          if (currentSeq === uploadSequence) {
-            clearPendingFlag();
+
+          if (useIncrementalPatch && batchSnapshot) {
+            Object.keys(batchSnapshot).forEach(k => {
+              if (pendingPatchMap[k] === batchSnapshot[k]) {
+                delete pendingPatchMap[k];
+              }
+            });
+            await savePendingPatches();
+          }
+
+          if (currentSeq === uploadSequence && Object.keys(pendingPatchMap).length === 0) {
+            await clearPendingFlag();
             const nowStr = formatClockTime();
             safeSetStorage(LOCAL_LAST_SAVED_KEY, nowStr);
             updateLastSavedDisplay(nowStr);
@@ -836,18 +925,21 @@
             syncToCloudIfNeeded(false, allowEmptyOverwrite);
           }
         })
-        .catch((err) => {
+        .catch(async (err) => {
           isUploadingToCloud = false;
           hasPendingLocalChanges = true;
           safeSetStorage(LOCAL_PENDING_KEY, 'true');
           safeSetStorage(LOCAL_PENDING_TS_KEY, String(localStateUpdatedAt));
+          await savePendingPatches();
           console.warn('雲端背景同步暫時失敗，已保留於本地並將於 6 秒後自動重試:', err);
           updateSyncBadge('pending', '本地已存 · 待重試');
         });
     }
 
     async function manualReconnectAndSave() {
+      needsFullSync = true;
       await persistStateLocally(true);
+      await savePendingPatches();
       if (useFirebase && db) {
         try {
           db.goOffline();
@@ -3650,21 +3742,27 @@
     async function handleBoothMapUpload(e, boothId) {
       const file = e.target.files[0];
       if (!file) return;
-      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 760, 0.72);
-      state.events[state.activeEventId].booths[boothId].boothMapImage = compressed;
-      await saveData();
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMG_PRESET.boothMap.maxWidth, IMG_PRESET.boothMap.quality);
+      const evId = state.activeEventId;
+      state.events[evId].booths[boothId].boothMapImage = compressed;
+      await savePatchData({
+        [`doujinPlanner/events/${evId}/booths/${boothId}/boothMapImage`]: compressed
+      });
       render();
     }
 
     async function pasteBoothMap(boothId) {
       try {
-        const compressed = await extractCompressedImageFromClipboard(760, 0.72);
+        const compressed = await extractCompressedImageFromClipboard(IMG_PRESET.boothMap.maxWidth, IMG_PRESET.boothMap.quality);
         if (!compressed) {
           alert('剪貼板中沒有找到圖片');
           return;
         }
-        state.events[state.activeEventId].booths[boothId].boothMapImage = compressed;
-        await saveData();
+        const evId = state.activeEventId;
+        state.events[evId].booths[boothId].boothMapImage = compressed;
+        await savePatchData({
+          [`doujinPlanner/events/${evId}/booths/${boothId}/boothMapImage`]: compressed
+        });
         render();
       } catch (err) {
         alert('無法讀取剪貼板圖片，請確認瀏覽器已允許剪貼板權限，或改用「選擇圖片」上傳。');
@@ -3674,43 +3772,52 @@
     async function handleBoothFlyerUpload(e, boothId) {
       const files = Array.from(e.target.files);
       if (!files.length) return;
-      const booth = state.events[state.activeEventId].booths[boothId];
+      const evId = state.activeEventId;
+      const booth = state.events[evId].booths[boothId];
       if (!Array.isArray(booth.flyerImages)) {
         booth.flyerImages = booth.flyerImage ? [{ url: booth.flyerImage, link: '' }] : [];
       }
       for (const file of files) {
-        const compressed = await readBlobOrFileAsCompressedDataUrl(file, 960, 0.74);
+        const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMG_PRESET.flyer.maxWidth, IMG_PRESET.flyer.quality);
         booth.flyerImages.push({ url: compressed, link: '' });
       }
-      await saveData();
+      await savePatchData({
+        [`doujinPlanner/events/${evId}/booths/${boothId}/flyerImages`]: booth.flyerImages
+      });
       render();
     }
 
     async function handleSingleBoothFlyerUpload(e, boothId, flyerIdx) {
       const file = e.target.files[0];
       if (!file) return;
-      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 960, 0.74);
-      const booth = state.events[state.activeEventId].booths[boothId];
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMG_PRESET.flyer.maxWidth, IMG_PRESET.flyer.quality);
+      const evId = state.activeEventId;
+      const booth = state.events[evId].booths[boothId];
       const flyers = getBoothFlyers(booth);
       if (flyers[flyerIdx]) flyers[flyerIdx].url = compressed;
       booth.flyerImages = flyers;
-      await saveData();
+      await savePatchData({
+        [`doujinPlanner/events/${evId}/booths/${boothId}/flyerImages`]: flyers
+      });
       render();
     }
 
     async function pasteBoothFlyer(boothId) {
       try {
-        const compressed = await extractCompressedImageFromClipboard(960, 0.74);
+        const compressed = await extractCompressedImageFromClipboard(IMG_PRESET.flyer.maxWidth, IMG_PRESET.flyer.quality);
         if (!compressed) {
           alert('剪貼板中沒有找到圖片');
           return;
         }
-        const booth = state.events[state.activeEventId].booths[boothId];
+        const evId = state.activeEventId;
+        const booth = state.events[evId].booths[boothId];
         if (!Array.isArray(booth.flyerImages)) {
           booth.flyerImages = booth.flyerImage ? [{ url: booth.flyerImage, link: '' }] : [];
         }
         booth.flyerImages.push({ url: compressed, link: '' });
-        await saveData();
+        await savePatchData({
+          [`doujinPlanner/events/${evId}/booths/${boothId}/flyerImages`]: booth.flyerImages
+        });
         render();
       } catch (err) {
         alert('無法讀取剪貼板');
@@ -3719,16 +3826,19 @@
 
     async function pasteSingleBoothFlyer(boothId, flyerIdx) {
       try {
-        const compressed = await extractCompressedImageFromClipboard(960, 0.74);
+        const compressed = await extractCompressedImageFromClipboard(IMG_PRESET.flyer.maxWidth, IMG_PRESET.flyer.quality);
         if (!compressed) {
           alert('剪貼板中沒有找到圖片');
           return;
         }
-        const booth = state.events[state.activeEventId].booths[boothId];
+        const evId = state.activeEventId;
+        const booth = state.events[evId].booths[boothId];
         const flyers = getBoothFlyers(booth);
         if (flyers[flyerIdx]) flyers[flyerIdx].url = compressed;
         booth.flyerImages = flyers;
-        await saveData();
+        await savePatchData({
+          [`doujinPlanner/events/${evId}/booths/${boothId}/flyerImages`]: flyers
+        });
         render();
       } catch (err) {
         alert('無法讀取剪貼板');
@@ -3736,11 +3846,15 @@
     }
 
     function removeBoothFlyer(boothId, flyerIdx) {
-      const booth = state.events[state.activeEventId].booths[boothId];
+      const evId = state.activeEventId;
+      const booth = state.events[evId].booths[boothId];
       const flyers = getBoothFlyers(booth);
       flyers.splice(flyerIdx, 1);
       booth.flyerImages = flyers;
-      saveData(); render();
+      savePatchData({
+        [`doujinPlanner/events/${evId}/booths/${boothId}/flyerImages`]: flyers
+      });
+      render();
     }
 
     function toggleItemEdit(itemId) { state.editingItems[itemId] = !state.editingItems[itemId]; render(); }
@@ -3783,21 +3897,27 @@
     async function handleItemImageUpload(e, boothId, itemId) {
       const file = e.target.files[0];
       if (!file) return;
-      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 720, 0.72);
-      state.events[state.activeEventId].booths[boothId].items[itemId].itemImage = compressed;
-      await saveData();
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMG_PRESET.item.maxWidth, IMG_PRESET.item.quality);
+      const evId = state.activeEventId;
+      state.events[evId].booths[boothId].items[itemId].itemImage = compressed;
+      await savePatchData({
+        [`doujinPlanner/events/${evId}/booths/${boothId}/items/${itemId}/itemImage`]: compressed
+      });
       render();
     }
 
     async function pasteItemImage(boothId, itemId) {
       try {
-        const compressed = await extractCompressedImageFromClipboard(720, 0.72);
+        const compressed = await extractCompressedImageFromClipboard(IMG_PRESET.item.maxWidth, IMG_PRESET.item.quality);
         if (!compressed) {
           alert('剪貼板中沒有找到圖片');
           return;
         }
-        state.events[state.activeEventId].booths[boothId].items[itemId].itemImage = compressed;
-        await saveData();
+        const evId = state.activeEventId;
+        state.events[evId].booths[boothId].items[itemId].itemImage = compressed;
+        await savePatchData({
+          [`doujinPlanner/events/${evId}/booths/${boothId}/items/${itemId}/itemImage`]: compressed
+        });
         render();
       } catch (err) {
         alert('無法讀取剪貼板');
@@ -3901,13 +4021,17 @@
       const ctx = canvas.getContext('2d');
       ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
 
-      const croppedUrl = await compressImageDataUrl(canvas.toDataURL('image/jpeg', 0.8), 720, 0.72);
+      const croppedUrl = await compressImageDataUrl(canvas.toDataURL('image/jpeg', 0.78), IMG_PRESET.item.maxWidth, IMG_PRESET.item.quality);
       if (isNewItemModal) {
         tempNewItemImageData = croppedUrl;
         openNewItemModal(boothId);
       } else {
-        state.events[state.activeEventId].booths[boothId].items[itemId].itemImage = croppedUrl;
-        await saveData(); closeModal(); render();
+        const evId = state.activeEventId;
+        state.events[evId].booths[boothId].items[itemId].itemImage = croppedUrl;
+        await savePatchData({
+          [`doujinPlanner/events/${evId}/booths/${boothId}/items/${itemId}/itemImage`]: croppedUrl
+        });
+        closeModal(); render();
       }
     }
 
@@ -4266,7 +4390,7 @@
     async function handleNewModalFlyerFile(e, inp) {
       const file = e.target.files[0];
       if (!file) return;
-      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 960, 0.74);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMG_PRESET.flyer.maxWidth, IMG_PRESET.flyer.quality);
       const itemBox = inp.closest('.new-b-flyer-item').querySelector('.flyer-thumb-box');
       itemBox.dataset.url = compressed;
       itemBox.innerHTML = `<img src="${compressed}" class="w-full h-full object-cover rounded" />`;
@@ -4274,7 +4398,7 @@
 
     async function pasteNewModalFlyerImg(btn) {
       try {
-        const compressed = await extractCompressedImageFromClipboard(960, 0.74);
+        const compressed = await extractCompressedImageFromClipboard(IMG_PRESET.flyer.maxWidth, IMG_PRESET.flyer.quality);
         if (!compressed) return alert('剪貼板無圖片');
         const itemBox = btn.closest('.new-b-flyer-item').querySelector('.flyer-thumb-box');
         itemBox.dataset.url = compressed;
@@ -4285,14 +4409,14 @@
     async function handleNewBoothMapUpload(e) {
       const file = e.target.files[0];
       if (!file) return;
-      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 760, 0.72);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMG_PRESET.boothMap.maxWidth, IMG_PRESET.boothMap.quality);
       tempNewBoothMapData = compressed;
       document.getElementById('new-b-map-preview').innerHTML = `<img src="${tempNewBoothMapData}" class="w-full h-full object-cover" />`;
     }
 
     async function pasteNewBoothMap() {
       try {
-        const compressed = await extractCompressedImageFromClipboard(760, 0.72);
+        const compressed = await extractCompressedImageFromClipboard(IMG_PRESET.boothMap.maxWidth, IMG_PRESET.boothMap.quality);
         if (!compressed) return alert('剪貼板無圖片');
         tempNewBoothMapData = compressed;
         document.getElementById('new-b-map-preview').innerHTML = `<img src="${tempNewBoothMapData}" class="w-full h-full object-cover" />`;
@@ -4454,14 +4578,14 @@
     async function handleNewItemImageUpload(e) {
       const file = e.target.files[0];
       if (!file) return;
-      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 720, 0.72);
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMG_PRESET.item.maxWidth, IMG_PRESET.item.quality);
       tempNewItemImageData = compressed;
       document.getElementById('new-it-img-preview').innerHTML = `<img src="${tempNewItemImageData}" class="w-full h-full object-cover" />`;
     }
 
     async function pasteNewItemImage() {
       try {
-        const compressed = await extractCompressedImageFromClipboard(720, 0.72);
+        const compressed = await extractCompressedImageFromClipboard(IMG_PRESET.item.maxWidth, IMG_PRESET.item.quality);
         if (!compressed) return alert('剪貼板無圖片');
         tempNewItemImageData = compressed;
         document.getElementById('new-it-img-preview').innerHTML = `<img src="${tempNewItemImageData}" class="w-full h-full object-cover" />`;
@@ -4512,9 +4636,14 @@
     async function handleMapUpload(e) {
       const file = e.target.files[0];
       if (!file) return;
-      const compressed = await readBlobOrFileAsCompressedDataUrl(file, 1100, 0.75);
-      state.events[state.activeEventId].mapImage = compressed;
-      closeModal(); await saveData(); render();
+      const compressed = await readBlobOrFileAsCompressedDataUrl(file, IMG_PRESET.hallMap.maxWidth, IMG_PRESET.hallMap.quality);
+      const evId = state.activeEventId;
+      state.events[evId].mapImage = compressed;
+      closeModal();
+      await savePatchData({
+        [`doujinPlanner/events/${evId}/mapImage`]: compressed
+      });
+      render();
     }
 
     function openMapPinModal(boothId) {
