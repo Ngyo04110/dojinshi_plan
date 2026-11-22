@@ -1220,23 +1220,27 @@
       saveData();
     }
 
-    function getAllItemTags(filterEv = 'all'){
+    function getTopTags() {
       const excluded = ['既刊', '新刊'];
-      const tagSet = new Set();
+      const counts = {};
       Object.values(state.events || {}).forEach(ev => {
-        if (filterEv && filterEv !== 'all' && ev.id !== filterEv) return;
         Object.values(ev.booths || {}).forEach(b => {
           Object.values(b.items || {}).forEach(it => {
             if (Array.isArray(it.tags)) {
               it.tags.forEach(t => {
-                const clean = (t || '').trim();
-                if (clean) tagSet.add(clean);
+                const clean = t.trim();
+                if (clean && !excluded.includes(clean)) {
+                  counts[clean] = (counts[clean] || 0) + 1;
+                }
               });
             }
           });
         });
       });
-      return Array.from(tagSet);
+      const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]).map(e => e[0]);
+      const defaults = ['R-18', '漫畫', '小說', '合誌', '貼紙', '壓克力', '周邊', '特典'];
+      const combined = [...new Set([...sorted, ...defaults])].filter(t => !excluded.includes(t));
+      return combined.slice(0, 10);
     }
 
     function getAllAuthorsLibrary() {
@@ -2303,18 +2307,9 @@
         } else {
           html += `
             <div class="card p-2 overflow-hidden relative">
-           <div class="flex items-center justify-between gap-2 mb-2 px-2 flex-wrap">
-             <div class="text-xs text-gray-400">點擊攤位標籤可快速查看</div>
-             <div class="flex items-center gap-1.5">
-               <button type="button" onclick="clearEventMapPins()" class="px-2.5 py-1 rounded-lg bg-amber-50 text-amber-700 border border-amber-200 text-xs font-bold">
-                 <i class="fa-solid fa-location-dot mr-1"></i>清除地圖上的標記
-               </button>
-               <button type="button" onclick="clearEventMapImage()" class="px-2.5 py-1 rounded-lg bg-red-50 text-red-600 border border-red-200 text-xs font-bold">
-                 <i class="fa-solid fa-trash mr-1"></i>清除會場地圖
-               </button>
-             </div>
-           </div>
-           <div class="relative w-full overflow-auto border rounded-xl bg-gray-100" style="max-height: 65vh;">        ${renderImgTag(currentEv.mapImage, 'w-full h-auto block', 'data-event-map="true"')}
+              <div class="text-xs text-gray-400 mb-2 px-2">點擊攤位標籤可快速查看</div>
+              <div class="relative w-full overflow-auto border rounded-xl bg-gray-100" style="max-height: 65vh;">
+                ${renderImgTag(currentEv.mapImage, 'w-full h-auto block', 'data-event-map="true"')}
                 ${booths.map((b, i) => {
                   const isDone = isBoothAllDone(b);
                   return `
@@ -2362,21 +2357,24 @@
         html += `
           <div class="card p-4 mb-3 transition booth-card ${isAllDone ? 'opacity-60 bg-gray-50' : 'border-l-4 border-l-[#4A7C6F]'}" data-booth-id="${b.id}">
             <div class="flex justify-between items-center mb-3">
-           <div class="flex items-center gap-2">
-             <div class="drag-handle cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-700 px-1.5 py-2 touch-none select-none" data-booth-id="${b.id}" data-idx="${idx}" title="按住拖曳排序，或輕點調整">
-               <i class="fa-solid fa-bars text-sm"></i>
-             </div>
-             <span class="booth-map-img-slot contents">${b.boothMapImage ? renderImgTag(b.boothMapImage, `${boothMapImgSize} object-cover rounded-lg border shrink-0 transition-all`, 'title="攤位圖"') : ''}</span>
-             <div>
-               <div class="flex items-center gap-2 flex-wrap">
-                 <span class="text-xs font-bold text-[#4A7C6F]">#${idx + 1}</span>
-                 <span class="font-bold text-lg text-[#2C3531]">${b.code || '未填攤位號'}</span>
-                 ${b.circle ? `<span class="text-sm text-gray-600">${b.circle}</span>` : ''}
-                 <span class="bg-[#D96B43]/10 text-[#D96B43] text-xs font-bold px-2 py-0.5 rounded-full">預計: ${formatCurrency(boothTotal, currentEv.id)}</span>
-               </div>
-             </div>
-           </div>
-         </div>
+              <div class="flex items-center gap-2">
+                <div class="drag-handle cursor-grab active:cursor-grabbing text-gray-400 hover:text-gray-700 px-1.5 py-2 touch-none select-none" data-booth-id="${b.id}" data-idx="${idx}" title="按住拖曳排序，或輕點調整">
+                  <i class="fa-solid fa-bars text-sm"></i>
+                </div>
+                <span class="booth-map-img-slot contents">${b.boothMapImage ? renderImgTag(b.boothMapImage, `${boothMapImgSize} object-cover rounded-lg border shrink-0 transition-all`, 'title="攤位圖"') : ''}</span>
+                <div>
+                  <div class="flex items-center gap-2 flex-wrap">
+                    <span class="text-xs font-bold text-[#4A7C6F]">#${idx + 1}</span>
+                    <span class="font-bold text-lg text-[#2C3531]">${b.code || '未填攤位號'}</span>
+                    ${b.circle ? `<span class="text-sm text-gray-600">${b.circle}</span>` : ''}
+                    <span class="bg-[#D96B43]/10 text-[#D96B43] text-xs font-bold px-2 py-0.5 rounded-full">預計: ${formatCurrency(boothTotal, currentEv.id)}</span>
+                  </div>
+                </div>
+              </div>
+              <button onclick="openMapPinModal('${b.id}')" class="text-xs text-gray-500 bg-gray-100 px-2.5 py-1 rounded-full shrink-0">
+                <i class="fa-solid fa-location-dot text-[#D96B43] mr-1"></i>標記位置
+              </button>
+            </div>
 
             ${sashiireEntries.length > 0 ? `
               <div class="mb-3 bg-amber-50/90 border border-amber-200 p-2.5 rounded-xl space-y-1.5">
@@ -3277,7 +3275,7 @@
       const filterEv = state.libraryFilterEvent || 'all';
       const filterTag = state.libraryFilterTag || 'all';
       const evList = getSortedEvents();
-      const allTags = getAllItemTags(filterEv);
+      const allTags = getTopTags();
 
       container.innerHTML = `
         <div class="card p-4 mb-3">
@@ -4496,172 +4494,100 @@
       const priceStep = currencyCode === 'JPY' ? '100' : '1';
       const pricePlaceholder = currencyCode === 'JPY' ? '例: 500 (選填)' : '選填';
 
-let tempNewItemImg = '';
-      let tempNewItemDraft = null;
-
-      function captureNewItemFormDraft(bId) {
-        const links = Array.from(document.querySelectorAll('.new-it-link-inp')).map(i => i.value);
-        const checkedAuthors = Array.from(document.querySelectorAll('.new-item-author-chk:checked')).map(c => c.value);
-        const reqs = {};
-        document.querySelectorAll('.new-item-req-input').forEach(inp => {
-          reqs[inp.dataset.member] = parseInt(inp.value) || 0;
-        });
-        tempNewItemDraft = {
-          boothId: bId,
-          name: document.getElementById('new-it-name')?.value || '',
-          price: document.getElementById('new-it-price')?.value || '',
-          reserve: document.getElementById('new-it-reserve')?.value || '0',
-          links: links.length > 0 ? links : [''],
-          tags: document.getElementById('new-it-tags')?.value || '',
-          checkedAuthors,
-          extraAuthor: document.getElementById('new-item-extra-author-input')?.value || '',
-          reqs
-        };
-      }
-
-      function renderNewItemFormModal(bId, draft = null) {
-        const bObj = state.events[state.activeEventId].booths[bId];
-        const allAuthors = [...new Set([...boothAuthors, ...(draft?.checkedAuthors || [])])];
-        const previewSrc = tempNewItemImg ? getImageSrc(tempNewItemImg) : '';
-        const linksList = (draft?.links && draft.links.length > 0) ? draft.links : [''];
-
-        showModal(`
-          <div class="flex justify-between items-center mb-4">
-            <h3 class="font-bold text-base">新增商品至 ${bObj.code || bObj.circle || '攤位'}</h3>
-            <button onclick="tempNewItemDraft = null; tempNewItemImg = ''; closeModal();" class="text-gray-400 text-lg">&times;</button>
+      let tempNewItemImg = '';
+      showModal(`
+        <div class="flex justify-between items-center mb-4">
+          <h3 class="font-bold text-base">新增商品至 ${booth.code || booth.circle || '攤位'}</h3>
+          <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
+        </div>
+        <div class="space-y-3">
+          <div>
+            <label class="text-xs text-gray-500">商品名稱 *</label>
+            <input id="new-it-name" type="text" placeholder="例: 新刊本 / 壓克力立牌" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
           </div>
-          <div class="space-y-3">
+          <div class="grid grid-cols-2 gap-2">
             <div>
-              <label class="text-xs text-gray-500">商品名稱 *</label>
-              <input id="new-it-name" type="text" value="${(draft?.name || '').replace(/"/g, '&quot;')}" placeholder="例: 新刊本 / 壓克力立牌" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
+              <label class="text-xs text-gray-500">單價 (${currencyCode}) (選填)</label>
+              <input id="new-it-price" type="number" step="${priceStep}" placeholder="${pricePlaceholder}" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
             </div>
-            <div class="grid grid-cols-2 gap-2">
-              <div>
-                <label class="text-xs text-gray-500">單價 (${currencyCode}) (選填)</label>
-                <input id="new-it-price" type="number" step="${priceStep}" value="${(draft?.price || '').replace(/"/g, '&quot;')}" placeholder="${pricePlaceholder}" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
-              </div>
-              <div>
-                <label class="text-xs text-gray-500">留貨數量 (預留)</label>
-                <input id="new-it-reserve" type="number" min="0" value="${draft?.reserve ?? 0}" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
-              </div>
-            </div>
-
-            <div class="bg-[#F9FAF8] p-2.5 rounded-xl border space-y-1.5">
-              <label class="text-xs font-bold text-gray-700 block">商品創作者 (可多選)</label>
-              <div id="new-item-authors-checkboxes" class="flex flex-wrap gap-1.5">
-                ${allAuthors.map(aName => {
-                  const isChk = draft ? (draft.checkedAuthors || []).includes(aName) : true;
-                  return `
-                    <label class="flex items-center gap-1 px-2.5 py-1 rounded border text-xs cursor-pointer ${isChk ? 'bg-[#4A7C6F]/15 border-[#4A7C6F] font-bold text-[#4A7C6F]' : 'bg-white border-gray-200'}">
-                      <input type="checkbox" value="${aName}" ${isChk ? 'checked' : ''} class="new-item-author-chk w-3.5 h-3.5 accent-[#4A7C6F]" />
-                      <span>${aName}</span>
-                    </label>
-                  `;
-                }).join('')}
-              </div>
-              <div class="relative pt-1 flex gap-1.5 items-center">
-                <div class="relative flex-1">
-                  <input type="text" id="new-item-extra-author-input" value="${(draft?.extraAuthor || '').replace(/"/g, '&quot;')}" placeholder="搜尋作者庫或輸入新作者名稱..." oninput="handleNewItemAuthorSearchInputLive(this)" class="w-full border rounded-lg px-2.5 py-1 text-xs bg-white" autocomplete="off" />
-                  <div class="new-item-author-search-dropdown hidden search-dropdown"></div>
-                </div>
-                <button type="button" onclick="addInstantAuthorToNewItem()" class="px-2.5 py-1 bg-[#4A7C6F] text-white rounded-lg text-xs font-bold shrink-0 shadow-sm">
-                  + 加入
-                </button>
-              </div>
-            </div>
-
-            <div class="bg-[#F9FAF8] p-2.5 rounded-xl border space-y-1.5">
-              <div class="flex justify-between items-center">
-                <label class="text-xs font-bold text-gray-700">商品連結 URL (可複數)</label>
-                <button type="button" onclick="addNewItemLinkRow()" class="text-[11px] text-[#4A7C6F] font-bold">+ 新增連結</button>
-              </div>
-              <div id="new-item-links-container" class="space-y-1.5">
-                ${linksList.map(lnk => `
-                  <div class="flex gap-1.5 items-center">
-                    <input type="text" value="${(lnk || '').replace(/"/g, '&quot;')}" placeholder="https://..." class="new-it-link-inp flex-1 border rounded-lg px-2.5 py-1 text-xs bg-white" />
-                    <button type="button" onclick="pasteToInput(this)" class="px-2 py-1 bg-gray-100 rounded-lg text-[11px] font-bold">黏貼</button>
-                  </div>
-                `).join('')}
-              </div>
-            </div>
-
             <div>
-              <label class="text-xs text-gray-500">商品標籤 (以逗號分隔)</label>
-              <input id="new-it-tags" type="text" value="${(draft?.tags || '').replace(/"/g, '&quot;')}" placeholder="例: R-18, 漫畫" class="w-full border rounded-xl px-3 py-2 text-sm mt-1 mb-1.5" />
-              <div class="flex flex-wrap gap-1">
-                ${getTopTags().map(t => `
-                  <button type="button" onclick="appendTagToInput('new-it-tags', '${t}')" class="px-2 py-0.5 bg-gray-100 rounded text-[11px] text-gray-600 hover:bg-[#4A7C6F]/15">#${t}</button>
-                `).join('')}
-              </div>
+              <label class="text-xs text-gray-500">留貨數量 (預留)</label>
+              <input id="new-it-reserve" type="number" min="0" value="0" class="w-full border rounded-xl px-3 py-2 text-sm mt-1" />
             </div>
+          </div>
 
-            <div>
-              <label class="text-xs text-gray-500 block mb-1">商品圖片</label>
-              <div class="flex items-center gap-2 flex-wrap">
-                <div id="new-it-img-preview" class="w-12 h-12 bg-gray-100 rounded-xl flex items-center justify-center text-[10px] text-gray-400 overflow-hidden border ${previewSrc ? 'border-[#4A7C6F] ring-2 ring-[#4A7C6F]/25' : ''}">
-                  ${previewSrc ? `<img src="${previewSrc}" class="w-full h-full object-cover" />` : '無圖'}
-                </div>
-                <label class="py-1.5 px-3 bg-gray-100 rounded-xl text-xs font-bold text-gray-700 cursor-pointer">
-                  上傳圖片<input type="file" accept="image/*" id="new-it-img-file" class="hidden" />
+          <div class="bg-[#F9FAF8] p-2.5 rounded-xl border space-y-1.5">
+            <label class="text-xs font-bold text-gray-700 block">商品創作者 (可多選)</label>
+            <div id="new-item-authors-checkboxes" class="flex flex-wrap gap-1.5">
+              ${boothAuthors.map(aName => `
+                <label class="flex items-center gap-1 px-2.5 py-1 rounded border text-xs cursor-pointer bg-[#4A7C6F]/15 border-[#4A7C6F] font-bold text-[#4A7C6F]">
+                  <input type="checkbox" value="${aName}" checked class="new-item-author-chk w-3.5 h-3.5 accent-[#4A7C6F]" />
+                  <span>${aName}</span>
                 </label>
-                <button type="button" onclick="openCropFromFlyerModalNewItem('${bId}')" class="py-1.5 px-3 bg-amber-100 text-amber-800 rounded-xl text-xs font-bold">
-                  <i class="fa-solid fa-crop-simple mr-1"></i>${previewSrc ? '重新截取' : '攤宣截取'}
-                </button>
-                ${previewSrc ? `<img src="${previewSrc}" alt="已截取預覽" class="w-9 h-9 rounded-lg object-cover border border-[#4A7C6F] shrink-0" />` : ''}
-                <button type="button" id="btn-paste-new-it-img" class="py-1.5 px-3 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-xl text-xs font-bold">黏貼圖片</button>
-              </div>
+              `).join('')}
             </div>
-
-            <div class="pt-2 border-t">
-              <label class="text-xs font-bold text-gray-700 block mb-2">各成員需求數量：</label>
-              <div class="space-y-2">
-                ${state.members.map(m => {
-                  const reqVal = draft?.reqs?.[m] ?? 0;
-                  return `
-                    <div class="flex justify-between items-center bg-gray-50 px-3 py-1.5 rounded-xl">
-                      <span class="text-sm font-medium">${m}</span>
-                      <input type="number" min="0" value="${reqVal}" data-member="${m}" class="new-item-req-input w-16 border rounded-lg px-2 py-1 text-center text-sm font-bold" />
-                    </div>
-                  `;
-                }).join('')}
+            <div class="relative pt-1 flex gap-1.5 items-center">
+              <div class="relative flex-1">
+                <input type="text" id="new-item-extra-author-input" placeholder="搜尋作者庫或輸入新作者名稱..." oninput="handleNewItemAuthorSearchInputLive(this)" class="w-full border rounded-lg px-2.5 py-1 text-xs bg-white" autocomplete="off" />
+                <div class="new-item-author-search-dropdown hidden search-dropdown"></div>
               </div>
+              <button type="button" onclick="addInstantAuthorToNewItem()" class="px-2.5 py-1 bg-[#4A7C6F] text-white rounded-lg text-xs font-bold shrink-0 shadow-sm">
+                + 加入
+              </button>
             </div>
-            <button onclick="saveNewItem('${bId}')" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold mt-2">確認新增商品</button>
           </div>
-        `);
 
-        document.getElementById('new-it-img-file').onchange = async (e) => {
-          const f = e.target.files[0];
-          if (!f) return;
-          const preset = IMAGE_PRESETS.item;
-          const compressed = await readBlobOrFileAsCompressedDataUrl(f, preset.maxWidth, preset.quality, preset.maxBytes);
-          tempNewItemImg = await externalizeLargeImage(compressed);
-          captureNewItemFormDraft(bId);
-          renderNewItemFormModal(bId, tempNewItemDraft);
-        };
+          <div class="bg-[#F9FAF8] p-2.5 rounded-xl border space-y-1.5">
+            <div class="flex justify-between items-center">
+              <label class="text-xs font-bold text-gray-700">商品連結 URL (可複數)</label>
+              <button type="button" onclick="addNewItemLinkRow()" class="text-[11px] text-[#4A7C6F] font-bold">+ 新增連結</button>
+            </div>
+            <div id="new-item-links-container" class="space-y-1.5">
+              <div class="flex gap-1.5 items-center">
+                <input type="text" placeholder="https://..." class="new-it-link-inp flex-1 border rounded-lg px-2.5 py-1 text-xs bg-white" />
+                <button type="button" onclick="pasteToInput(this)" class="px-2 py-1 bg-gray-100 rounded-lg text-[11px] font-bold">黏貼</button>
+              </div>
+            </div>
+          </div>
 
-        document.getElementById('btn-paste-new-it-img').onclick = async () => {
-          try {
-            const items = await navigator.clipboard.read();
-            for (const item of items) {
-              for (const type of item.types) {
-                if (type.startsWith('image/')) {
-                  const blob = await item.getType(type);
-                  const preset = IMAGE_PRESETS.item;
-                  const compressed = await readBlobOrFileAsCompressedDataUrl(blob, preset.maxWidth, preset.quality, preset.maxBytes);
-                  tempNewItemImg = await externalizeLargeImage(compressed);
-                  captureNewItemFormDraft(bId);
-                  renderNewItemFormModal(bId, tempNewItemDraft);
-                  return;
-                }
-              }
-            }
-            alert('剪貼簿中未找到圖片');
-          } catch (err) { alert('無法存取剪貼簿'); }
-        };
-      }
+          <div>
+            <label class="text-xs text-gray-500">商品標籤 (以逗號分隔)</label>
+            <input id="new-it-tags" type="text" placeholder="例: R-18, 漫畫" class="w-full border rounded-xl px-3 py-2 text-sm mt-1 mb-1.5" />
+            <div class="flex flex-wrap gap-1">
+              ${getTopTags().map(t => `
+                <button type="button" onclick="appendTagToInput('new-it-tags', '${t}')" class="px-2 py-0.5 bg-gray-100 rounded text-[11px] text-gray-600 hover:bg-[#4A7C6F]/15">#${t}</button>
+              `).join('')}
+            </div>
+          </div>
 
-      renderNewItemFormModal(booth.id, null);
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">商品圖片</label>
+            <div class="flex items-center gap-2 flex-wrap">
+              <div id="new-it-img-preview" class="w-12 h-12 bg-gray-100 rounded-xl flex items-center justify-center text-[10px] text-gray-400 overflow-hidden border">無圖</div>
+              <label class="py-1.5 px-3 bg-gray-100 rounded-xl text-xs font-bold text-gray-700 cursor-pointer">
+                上傳圖片<input type="file" accept="image/*" id="new-it-img-file" class="hidden" />
+              </label>
+              <button type="button" onclick="openCropFromFlyerModalNewItem('${boothId}')" class="py-1.5 px-3 bg-amber-100 text-amber-800 rounded-xl text-xs font-bold">
+                <i class="fa-solid fa-crop-simple mr-1"></i>攤宣截取
+              </button>
+              <button type="button" id="btn-paste-new-it-img" class="py-1.5 px-3 bg-[#4A7C6F]/15 text-[#4A7C6F] rounded-xl text-xs font-bold">黏貼圖片</button>
+            </div>
+          </div>
+
+          <div class="pt-2 border-t">
+            <label class="text-xs font-bold text-gray-700 block mb-2">各成員需求數量：</label>
+            <div class="space-y-2">
+              ${state.members.map(m => `
+                <div class="flex justify-between items-center bg-gray-50 px-3 py-1.5 rounded-xl">
+                  <span class="text-sm font-medium">${m}</span>
+                  <input type="number" min="0" value="0" data-member="${m}" class="new-item-req-input w-16 border rounded-lg px-2 py-1 text-center text-sm font-bold" />
+                </div>
+              `).join('')}
+            </div>
+          </div>
+          <button onclick="saveNewItem('${boothId}')" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold mt-2">確認新增商品</button>
+        </div>
+      `);
 
       window.addNewItemLinkRow = () => {
         const c = document.getElementById('new-item-links-container');
@@ -4676,125 +4602,81 @@ let tempNewItemImg = '';
         const bObj = state.events[state.activeEventId].booths[bId];
         const flyers = getBoothFlyers(bObj).map(f => ({ ...f, resolvedUrl: getImageSrc(f.url) })).filter(f => f.resolvedUrl);
         if (flyers.length === 0) return alert('此攤位尚未上傳攤宣圖片');
+        const tmpBox = document.createElement('div');
+        tmpBox.id = 'tmp-crop-receiver';
+        document.body.appendChild(tmpBox);
+        const origClose = window.closeModal;
+        openCropFromFlyerModal(bId, '__NEW_ITEM_TMP__');
+        const applyBtn = document.getElementById('btn-apply-crop');
+        if (applyBtn) {
+          applyBtn.onclick = async () => {
+            const imgEl = document.getElementById('crop-source-img');
+            const stage = document.getElementById('crop-stage');
+            const box = document.getElementById('crop-box');
+            const natW = imgEl.naturalWidth; const natH = imgEl.naturalHeight;
+            const stageW = stage.clientWidth; const stageH = stage.clientHeight;
+            const imgAspect = natW / natH; const stageAspect = stageW / stageH;
+            let renderW, renderH, offsetX, offsetY;
+            if (imgAspect > stageAspect) {
+              renderW = stageW; renderH = stageW / imgAspect;
+              offsetX = 0; offsetY = (stageH - renderH) / 2;
+            } else {
+              renderH = stageH; renderW = stageH * imgAspect;
+              offsetY = 0; offsetX = (stageW - renderW) / 2;
+            }
+            const bx = box.offsetLeft; const by = box.offsetTop; const bw = box.offsetWidth; const bh = box.offsetHeight;
+            const sx = Math.max(0, ((bx - offsetX) / renderW) * natW);
+            const sy = Math.max(0, ((by - offsetY) / renderH) * natH);
+            const sw = Math.min(natW - sx, (bw / renderW) * natW);
+            const sh = Math.min(natH - sy, (bh / renderH) * natH);
+            const canvas = document.createElement('canvas');
+            const preset = IMAGE_PRESETS.item;
+            const outW = Math.min(preset.maxWidth, Math.max(1, Math.round(sw)));
+            const outH = Math.max(1, Math.round(outW * (sh / Math.max(1, sw))));
+            canvas.width = outW; canvas.height = outH;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, outW, outH);
+            const rawCropped = canvas.toDataURL('image/jpeg', preset.quality);
+            const compressedCropped = await extremeCompressDataUrl(rawCropped, preset.maxWidth, preset.quality, preset.maxBytes);
+            tempNewItemImg = await externalizeLargeImage(compressedCropped);
+            const prev = document.getElementById('new-it-img-preview');
+            if (prev) prev.innerHTML = renderImgTag(tempNewItemImg, 'w-full h-full object-cover');
+            origClose();
+            if (tmpBox.parentNode) tmpBox.remove();
+          };
+        }
+      };
 
-        captureNewItemFormDraft(bId);
+      document.getElementById('new-it-img-file').onchange = async (e) => {
+        const f = e.target.files[0];
+        if (!f) return;
+        const preset = IMAGE_PRESETS.item;
+        const compressed = await readBlobOrFileAsCompressedDataUrl(f, preset.maxWidth, preset.quality, preset.maxBytes);
+        tempNewItemImg = await externalizeLargeImage(compressed);
+        const prev = document.getElementById('new-it-img-preview');
+        if (prev) prev.innerHTML = renderImgTag(tempNewItemImg, 'w-full h-full object-cover');
+      };
 
-        let currentFlyerIdx = 0;
-        let cropState = { x: 25, y: 25, size: 50 };
-
-        const renderLocalCropper = () => {
-          const flyerObj = flyers[currentFlyerIdx];
-          showModal(`
-            <div class="flex justify-between items-center mb-2">
-              <h3 class="font-bold text-sm text-gray-800"><i class="fa-solid fa-crop-simple text-amber-600 mr-1"></i>從攤宣截取商品圖</h3>
-              <button type="button" onclick="renderNewItemFormModal('${bId}', tempNewItemDraft)" class="text-gray-400 text-lg">&times;</button>
-            </div>
-            ${flyers.length > 1 ? `
-              <div class="flex gap-1.5 overflow-x-auto no-scrollbar py-1 mb-2">
-                ${flyers.map((fl, i) => `
-                  <button type="button" id="crop-flyer-tab-${i}" class="px-2.5 py-1 rounded-lg text-xs font-bold ${i === currentFlyerIdx ? 'bg-[#4A7C6F] text-white' : 'bg-gray-100 text-gray-600'}">攤宣 #${i + 1}</button>
-                `).join('')}
-              </div>
-            ` : ''}
-            <div class="text-[11px] text-gray-500 mb-2">拖曳或調整方框大小與位置，框內即為截取的商品圖：</div>
-            <div id="crop-stage" class="relative w-full overflow-hidden border rounded-xl bg-gray-900 select-none touch-none" style="max-height: 45vh;">
-              <img id="crop-source-img" src="${flyerObj.resolvedUrl}" class="w-full h-auto block select-none pointer-events-none" />
-              <div id="crop-box" style="left: ${cropState.x}%; top: ${cropState.y}%; width: ${cropState.size}%; height: ${cropState.size}%;"
-                   class="absolute border-2 border-amber-400 bg-amber-400/15 cursor-move flex items-end justify-end">
-                <div id="crop-resize-handle" class="w-5 h-5 bg-amber-400 text-gray-900 flex items-center justify-center cursor-nwse-resize rounded-tl text-[10px] font-bold">
-                  <i class="fa-solid fa-up-right-and-down-left-from-center"></i>
-                </div>
-              </div>
-            </div>
-            <div class="flex items-center gap-2 mt-3">
-              <span class="text-xs text-gray-500 font-bold">縮放:</span>
-              <input id="crop-size-slider" type="range" min="15" max="90" value="${cropState.size}" class="flex-1 accent-[#4A7C6F]" />
-              <span id="crop-size-label" class="text-xs font-bold text-gray-700 w-10 text-right">${cropState.size}%</span>
-            </div>
-            <button type="button" id="btn-apply-crop" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold shadow-sm mt-3">確認截取並設為商品圖</button>
-          `);
-
-          flyers.forEach((_, i) => {
-            const tab = document.getElementById(`crop-flyer-tab-${i}`);
-            if (tab) tab.onclick = () => { currentFlyerIdx = i; cropState = { x: 25, y: 25, size: 50 }; renderLocalCropper(); };
-          });
-
-          const slider = document.getElementById('crop-size-slider');
-          if (slider) {
-            slider.oninput = (e) => {
-              cropState.size = Math.min(100 - cropState.x, parseInt(e.target.value));
-              const box = document.getElementById('crop-box');
-              const lbl = document.getElementById('crop-size-label');
-              if (box) { box.style.width = cropState.size + '%'; box.style.height = cropState.size + '%'; }
-              if (lbl) lbl.innerText = cropState.size + '%';
-            };
-          }
-
-          const stage = document.getElementById('crop-stage');
-          const box = document.getElementById('crop-box');
-          const handle = document.getElementById('crop-resize-handle');
-          if (stage && box && handle) {
-            let mode = null, startX = 0, startY = 0, origX = 0, origY = 0, origSize = 0;
-            const onStart = (clientX, clientY, m) => { mode = m; startX = clientX; startY = clientY; origX = cropState.x; origY = cropState.y; origSize = cropState.size; };
-            const onMove = (clientX, clientY) => {
-              if (!mode) return;
-              const rect = stage.getBoundingClientRect();
-              const dxPct = ((clientX - startX) / rect.width) * 100;
-              const dyPct = ((clientY - startY) / rect.height) * 100;
-              if (mode === 'move') {
-                cropState.x = Math.max(0, Math.min(100 - cropState.size, origX + dxPct));
-                cropState.y = Math.max(0, Math.min(100 - cropState.size, origY + dyPct));
-              } else if (mode === 'resize') {
-                const delta = Math.max(dxPct, dyPct);
-                const maxAllowed = Math.min(100 - origX, 100 - origY);
-                cropState.size = Math.max(15, Math.min(maxAllowed, origSize + delta));
+      document.getElementById('btn-paste-new-it-img').onclick = async () => {
+        try {
+          const items = await navigator.clipboard.read();
+          for (const item of items) {
+            for (const type of item.types) {
+              if (type.startsWith('image/')) {
+                const blob = await item.getType(type);
+                const preset = IMAGE_PRESETS.item;
+                const compressed = await readBlobOrFileAsCompressedDataUrl(blob, preset.maxWidth, preset.quality, preset.maxBytes);
+                tempNewItemImg = await externalizeLargeImage(compressed);
+                const prev = document.getElementById('new-it-img-preview');
+                if (prev) prev.innerHTML = renderImgTag(tempNewItemImg, 'w-full h-full object-cover');
+                return;
               }
-              box.style.left = cropState.x + '%'; box.style.top = cropState.y + '%';
-              box.style.width = cropState.size + '%'; box.style.height = cropState.size + '%';
-              const lbl = document.getElementById('crop-size-label');
-              if (lbl) lbl.innerText = Math.round(cropState.size) + '%';
-            };
-            const onEnd = () => { mode = null; };
-            box.onmousedown = (e) => { if (e.target === handle || handle.contains(e.target)) return; e.stopPropagation(); onStart(e.clientX, e.clientY, 'move'); };
-            handle.onmousedown = (e) => { e.stopPropagation(); onStart(e.clientX, e.clientY, 'resize'); };
-            window.onmousemove = (e) => { if (mode) { onMove(e.clientX, e.clientY); e.preventDefault(); } };
-            window.onmouseup = () => onEnd();
-            box.ontouchstart = (e) => { if (e.target === handle || handle.contains(e.target)) return; e.stopPropagation(); onStart(e.touches[0].clientX, e.touches[0].clientY, 'move'); };
-            handle.ontouchstart = (e) => { e.stopPropagation(); onStart(e.touches[0].clientX, e.touches[0].clientY, 'resize'); };
-            window.ontouchmove = (e) => { if (mode) { onMove(e.touches[0].clientX, e.touches[0].clientY); e.preventDefault(); } };
-            window.ontouchend = () => onEnd();
+            }
           }
-
-          const applyBtn = document.getElementById('btn-apply-crop');
-          if (applyBtn) {
-            applyBtn.onclick = async () => {
-              const imgEl = document.getElementById('crop-source-img');
-              if (!imgEl) return;
-              const natW = imgEl.naturalWidth || imgEl.width;
-              const natH = imgEl.naturalHeight || imgEl.height;
-              const sx = Math.max(0, (cropState.x / 100) * natW);
-              const sy = Math.max(0, (cropState.y / 100) * natH);
-              const sw = Math.min(natW - sx, (cropState.size / 100) * natW);
-              const sh = Math.min(natH - sy, (cropState.size / 100) * natH);
-              const canvas = document.createElement('canvas');
-              const preset = IMAGE_PRESETS.item;
-              const outW = Math.min(preset.maxWidth, Math.max(1, Math.round(sw)));
-              const outH = Math.max(1, Math.round(outW * (sh / Math.max(1, sw))));
-              canvas.width = outW; canvas.height = outH;
-              const ctx = canvas.getContext('2d');
-              ctx.fillStyle = '#FFFFFF';
-              ctx.fillRect(0, 0, canvas.width, canvas.height);
-              ctx.drawImage(imgEl, sx, sy, sw, sh, 0, 0, outW, outH);
-              const rawCropped = canvas.toDataURL('image/jpeg', preset.quality);
-              const compressedCropped = await extremeCompressDataUrl(rawCropped, preset.maxWidth, preset.quality, preset.maxBytes);
-              tempNewItemImg = await externalizeLargeImage(compressedCropped);
-              if (tempNewItemImg !== compressedCropped) mediaMemoryCache[tempNewItemImg] = compressedCropped;
-              renderNewItemFormModal(bId, tempNewItemDraft);
-            };
-          }
-        };
-
-        renderLocalCropper();
+          alert('剪貼簿中未找到圖片');
+        } catch (err) { alert('無法存取剪貼簿'); }
       };
 
       window.saveNewItem = (bId) => {
@@ -4813,21 +4695,39 @@ let tempNewItemImg = '';
         });
 
         const ev = state.events[state.activeEventId];
-        const boothObj = ev.booths[bId];
-        if (!boothObj.items) boothObj.items = {};
+        const booth = ev.booths[bId];
+        if (!booth.items) booth.items = {};
         const itemId = 'item_' + Date.now();
-        const orderNum = Object.keys(boothObj.items).length + 1;
-        boothObj.items[itemId] = {
+        const orderNum = Object.keys(booth.items).length + 1;
+        booth.items[itemId] = {
           id: itemId, name, price, reserve, links, tags, authors,
           order: orderNum, status: 'pending', itemImage: tempNewItemImg,
           divisionCompleted: false, orders
         };
-        tempNewItemImg = '';
-        tempNewItemDraft = null;
         closeModal();
-        saveData(false, `events/${state.activeEventId}/booths/${bId}/items/${itemId}`, boothObj.items[itemId]);
+        saveData(false, `events/${state.activeEventId}/booths/${bId}/items/${itemId}`, booth.items[itemId]);
         render();
       };
+    }
+
+    function deleteItem(boothId, itemId) {
+      if (!confirm('確定要刪除此商品嗎？')) return;
+      delete state.events[state.activeEventId].booths[boothId].items[itemId];
+      saveData();
+    }
+
+    function updateBoughtQty(boothId, itemId, member, delta) {
+      const item = state.events[state.activeEventId].booths[boothId].items[itemId];
+      if (!item.orders[member]) item.orders[member] = { req: 0, bought: 0 };
+      item.orders[member].bought = Math.max(0, item.orders[member].bought + delta);
+      if (item.divisionCompleted) item.divisionCompleted = false;
+
+      const totalReq = state.members.reduce((s, m) => s + ((item.orders[m] && item.orders[m].req) || 0), 0);
+      const totalBought = state.members.reduce((s, m) => s + ((item.orders[m] && item.orders[m].bought) || 0), 0);
+      if (totalReq > 0 && totalBought >= totalReq) item.status = 'done';
+      else if (item.status === 'done' && totalBought < totalReq) item.status = 'pending';
+
+      saveData(false, `events/${state.activeEventId}/booths/${boothId}/items/${itemId}`, item);
     }
 
     function setItemStatus(boothId, itemId, status) {
@@ -5257,74 +5157,42 @@ let tempNewItemImg = '';
 
     function openMapPinModal(boothId) {
       const ev = state.events[state.activeEventId];
-      const booth = ev && ev.booths && ev.booths[boothId];
-      if (!ev || !booth) return;
+      const booth = ev.booths[boothId];
       if (!getImageSrc(ev.mapImage)) {
         alert('請先上傳會場地圖圖片才能標記攤位位置！');
         openMapUploadModal();
         return;
       }
-      let curX = typeof booth.x === 'number' ? booth.x : 50;
-      let curY = typeof booth.y === 'number' ? booth.y : 50;
+
+      let curX = booth.x || 50; let curY = booth.y || 50;
       showModal(`
         <div class="flex justify-between items-center mb-3">
-          <h3 class="font-bold text-base">標記攤位位置：${escapeAttr(booth.code || booth.circle || '')}</h3>
+          <h3 class="font-bold text-base">標記攤位位置：${booth.code || booth.circle || ''}</h3>
           <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
         </div>
         <p class="text-xs text-gray-500 mb-2">點擊地圖上的位置設定攤位座標：</p>
         <div id="pin-map-container" class="relative w-full h-64 border rounded-xl overflow-hidden cursor-crosshair bg-gray-100">
           ${renderImgTag(ev.mapImage, 'w-full h-full object-contain', 'data-event-map="true"')}
           <div id="pin-marker" style="left: ${curX}%; top: ${curY}%;" class="absolute -translate-x-1/2 -translate-y-1/2 px-2.5 py-1 rounded-full bg-[#D96B43] text-white text-xs font-bold shadow-lg ring-2 ring-white pointer-events-none">
-            ${escapeAttr(booth.code || '攤位')}
+            ${booth.code || '攤位'}
           </div>
         </div>
-        <button type="button" id="btn-save-pin" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold mt-4">確認位置</button>
+        <button onclick="saveMapPin('${boothId}')" id="btn-save-pin" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold mt-4">確認位置</button>
       `);
+
       const container = document.getElementById('pin-map-container');
       const marker = document.getElementById('pin-marker');
-      if (container && marker) {
-        container.onclick = (e) => {
-          const rect = container.getBoundingClientRect();
-          if (!rect.width || !rect.height) return;
-          curX = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
-          curY = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
-          marker.style.left = curX + '%';
-          marker.style.top = curY + '%';
-        };
-      }
-      const saveBtn = document.getElementById('btn-save-pin');
-      if (saveBtn) {
-        saveBtn.onclick = () => {
-          booth.x = curX;
-          booth.y = curY;
-          closeModal();
-          saveData(false, `events/${state.activeEventId}/booths/${boothId}`, booth);
-        };
-      }
-    }
-
-    function clearEventMapPins() {
-      const ev = state.events[state.activeEventId];
-      if (!ev || !ev.booths) return;
-      if (!confirm('確定要清除目前活動所有攤位在地圖上的標記嗎？')) return;
-      Object.values(ev.booths).forEach(b => {
-        if (b) {
-          delete b.x;
-          delete b.y;
-        }
-      });
-      saveData(false, `events/${state.activeEventId}/booths`, ev.booths);
-      render();
-    }
-
-    function clearEventMapImage() {
-      const ev = state.events[state.activeEventId];
-      if (!ev) return;
-      if (!confirm('確定要清除目前的會場地圖圖片嗎？')) return;
-      ev.mapImage = '';
-      if (typeof tempNewBoothMapData !== 'undefined') tempNewBoothMapData = '';
-      saveData(false, `events/${state.activeEventId}/mapImage`, '');
-      render();
+      container.onclick = (e) => {
+        const rect = container.getBoundingClientRect();
+        curX = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+        curY = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
+        marker.style.left = curX + '%'; marker.style.top = curY + '%';
+      };
+      document.getElementById('btn-save-pin').onclick = () => {
+        booth.x = curX; booth.y = curY;
+        closeModal();
+        saveData(false, `events/${state.activeEventId}/booths/${boothId}`, booth);
+      };
     }
 
     function openNewFavModal() {
