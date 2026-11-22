@@ -2303,9 +2303,18 @@
         } else {
           html += `
             <div class="card p-2 overflow-hidden relative">
-              <div class="text-xs text-gray-400 mb-2 px-2">點擊攤位標籤可快速查看</div>
-              <div class="relative w-full overflow-auto border rounded-xl bg-gray-100" style="max-height: 65vh;">
-                ${renderImgTag(currentEv.mapImage, 'w-full h-auto block', 'data-event-map="true"')}
+           <div class="flex items-center justify-between gap-2 mb-2 px-2 flex-wrap">
+             <div class="text-xs text-gray-400">點擊攤位標籤可快速查看</div>
+             <div class="flex items-center gap-1.5">
+               <button type="button" onclick="clearEventMapPins()" class="px-2.5 py-1 rounded-lg bg-amber-50 text-amber-700 border border-amber-200 text-xs font-bold">
+                 <i class="fa-solid fa-location-dot mr-1"></i>清除地圖上的標記
+               </button>
+               <button type="button" onclick="clearEventMapImage()" class="px-2.5 py-1 rounded-lg bg-red-50 text-red-600 border border-red-200 text-xs font-bold">
+                 <i class="fa-solid fa-trash mr-1"></i>清除會場地圖
+               </button>
+             </div>
+           </div>
+           <div class="relative w-full overflow-auto border rounded-xl bg-gray-100" style="max-height: 65vh;">        ${renderImgTag(currentEv.mapImage, 'w-full h-auto block', 'data-event-map="true"')}
                 ${booths.map((b, i) => {
                   const isDone = isBoothAllDone(b);
                   return `
@@ -5284,6 +5293,28 @@ let tempNewItemImg = '';
         closeModal();
         saveData(false, `events/${state.activeEventId}/booths/${boothId}`, booth);
       };
+    function clearEventMapPins() {
+      const ev = state.events[state.activeEventId];
+      if (!ev || !ev.booths) return;
+      if (!confirm('確定要清除目前活動所有攤位在地圖上的標記嗎？')) return;
+      Object.values(ev.booths).forEach(b => {
+        if (b) {
+          delete b.x;
+          delete b.y;
+        }
+      });
+      saveData(false, `events/${state.activeEventId}/booths`, ev.booths);
+      render();
+    }
+
+    function clearEventMapImage() {
+      const ev = state.events[state.activeEventId];
+      if (!ev) return;
+      if (!confirm('確定要清除目前的會場地圖圖片嗎？')) return;
+      ev.mapImage = '';
+      tempMapData = '';
+      saveData(false, `events/${state.activeEventId}/mapImage`, '');
+      render();
     }
 
     function openNewFavModal() {
