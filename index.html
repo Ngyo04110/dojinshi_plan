@@ -5257,43 +5257,52 @@ let tempNewItemImg = '';
 
     function openMapPinModal(boothId) {
       const ev = state.events[state.activeEventId];
-      const booth = ev.booths[boothId];
+      const booth = ev && ev.booths && ev.booths[boothId];
+      if (!ev || !booth) return;
       if (!getImageSrc(ev.mapImage)) {
         alert('請先上傳會場地圖圖片才能標記攤位位置！');
         openMapUploadModal();
         return;
       }
-    }
-
-      let curX = booth.x || 50; let curY = booth.y || 50;
+      let curX = typeof booth.x === 'number' ? booth.x : 50;
+      let curY = typeof booth.y === 'number' ? booth.y : 50;
       showModal(`
         <div class="flex justify-between items-center mb-3">
-          <h3 class="font-bold text-base">標記攤位位置：${booth.code || booth.circle || ''}</h3>
+          <h3 class="font-bold text-base">標記攤位位置：${escapeAttr(booth.code || booth.circle || '')}</h3>
           <button onclick="closeModal()" class="text-gray-400 text-lg">&times;</button>
         </div>
         <p class="text-xs text-gray-500 mb-2">點擊地圖上的位置設定攤位座標：</p>
         <div id="pin-map-container" class="relative w-full h-64 border rounded-xl overflow-hidden cursor-crosshair bg-gray-100">
           ${renderImgTag(ev.mapImage, 'w-full h-full object-contain', 'data-event-map="true"')}
           <div id="pin-marker" style="left: ${curX}%; top: ${curY}%;" class="absolute -translate-x-1/2 -translate-y-1/2 px-2.5 py-1 rounded-full bg-[#D96B43] text-white text-xs font-bold shadow-lg ring-2 ring-white pointer-events-none">
-            ${booth.code || '攤位'}
+            ${escapeAttr(booth.code || '攤位')}
           </div>
         </div>
-        <button onclick="saveMapPin('${boothId}')" id="btn-save-pin" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold mt-4">確認位置</button>
+        <button type="button" id="btn-save-pin" class="w-full btn-primary py-2.5 rounded-xl text-sm font-bold mt-4">確認位置</button>
       `);
-
       const container = document.getElementById('pin-map-container');
       const marker = document.getElementById('pin-marker');
-      container.onclick = (e) => {
-        const rect = container.getBoundingClientRect();
-        curX = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
-        curY = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
-        marker.style.left = curX + '%'; marker.style.top = curY + '%';
-      };
-      document.getElementById('btn-save-pin').onclick = () => {
-        booth.x = curX; booth.y = curY;
-        closeModal();
-        saveData(false, `events/${state.activeEventId}/booths/${boothId}`, booth);
-      };
+      if (container && marker) {
+        container.onclick = (e) => {
+          const rect = container.getBoundingClientRect();
+          if (!rect.width || !rect.height) return;
+          curX = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+          curY = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
+          marker.style.left = curX + '%';
+          marker.style.top = curY + '%';
+        };
+      }
+      const saveBtn = document.getElementById('btn-save-pin');
+      if (saveBtn) {
+        saveBtn.onclick = () => {
+          booth.x = curX;
+          booth.y = curY;
+          closeModal();
+          saveData(false, `events/${state.activeEventId}/booths/${boothId}`, booth);
+        };
+      }
+    }
+
     function clearEventMapPins() {
       const ev = state.events[state.activeEventId];
       if (!ev || !ev.booths) return;
@@ -5313,7 +5322,7 @@ let tempNewItemImg = '';
       if (!ev) return;
       if (!confirm('確定要清除目前的會場地圖圖片嗎？')) return;
       ev.mapImage = '';
-      tempMapData = '';
+      if (typeof tempNewBoothMapData !== 'undefined') tempNewBoothMapData = '';
       saveData(false, `events/${state.activeEventId}/mapImage`, '');
       render();
     }
