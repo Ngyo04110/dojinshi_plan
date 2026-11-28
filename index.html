@@ -944,7 +944,7 @@
             if (countSpan) {
               const currentRunner = state.activeRunner || 'all';
               const runnerPurchasedCount = currentRunner !== 'all' ? ((it.purchasedBy && it.purchasedBy[currentRunner]) || 0) : totalBought;
-              countSpan.textContent = currentRunner !== 'all' ? `${runnerPurchasedCount} 件` : `${totalBought}/${totalReq}`;
+              countSpan.textContent = currentRunner !== 'all' ? `${runnerPurchasedCount}/${totalReq}` : `${totalBought}/${totalReq}`;
               countSpan.className = `run-item-count-label font-bold w-14 text-center ${totalBought >= totalReq ? 'text-[#4A7C6F]' : 'text-[#D96B43]'}`;
             }
             const buyerSlot = itemBox.querySelector('.run-item-buyers-slot');
@@ -2439,7 +2439,7 @@
                       <div class="flex items-center gap-2">
                         <button onclick="updateRunnerPurchaseQty('${b.id}', '${it.id}', -1)" class="w-7 h-7 rounded bg-gray-100 font-bold text-gray-600">-</button>
                         <span class="run-item-count-label font-bold w-14 text-center ${totalBought >= totalReq ? 'text-[#4A7C6F]' : 'text-[#D96B43]'}">
-                          ${currentRunner !== 'all' ? `${runnerPurchasedCount} 件` : `${totalBought}/${totalReq}`}
+                          ${currentRunner !== 'all' ? `${runnerPurchasedCount}/${totalReq}` : `${totalBought}/${totalReq}`}
                         </span>
                         <button onclick="updateRunnerPurchaseQty('${b.id}', '${it.id}', 1)" class="w-7 h-7 rounded bg-[#4A7C6F]/15 font-bold text-[#4A7C6F]">+</button>
                       </div>
